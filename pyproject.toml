@@ -9,9 +9,9 @@ Features smart tracking to avoid re-picking items you've already seen or dropped
 """
 
 [project.urls]
-Repository = "https://github.com/galqawala/willow2autoLoot"
+Repository = "https://github.com/galqawala/AutoLoot"
 
 [tool.sdkmod]
 name = "AutoLoot"
 license = {name = "MIT", url = "https://choosealicense.com/licenses/mit/" }
-download = "https://github.com/galqawala/willow2autoLoot/releases/latest/download/autoloot.sdkmod"
+download = "https://github.com/galqawala/AutoLoot/releases/latest/download/autoloot.sdkmod"

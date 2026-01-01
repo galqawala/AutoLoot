@@ -1,3 +1,3 @@
 ---
-pyproject_url: https://raw.githubusercontent.com/galqawala/willow2autoLoot/refs/heads/master/pyproject.toml
+pyproject_url: https://raw.githubusercontent.com/galqawala/AutoLoot/refs/heads/master/pyproject.toml
 ---
