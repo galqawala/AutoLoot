@@ -1,17 +1,16 @@
-[build-system]
-requires = ["mods_base"]
-
 [project]
-name = "AutoLoot"
+name = "auto_loot"
 version = "2.0.1"
-authors = [{name = "galqawala"}]
-description = "Automatically picks up weapons and items with configurable options"
-readme = {text = "Automatically picks up weapons and items with configurable options", content-type = "text/plain"}
-requires-python = ">=3.11"
-keywords = ["bl-sdk"]
+authors = [{ name = "galqawala" }]
+description = """\
+Automatically picks up weapons and items with configurable options
+"""
 
 [project.urls]
-Repository = "https://github.com/bl-sdk/bl-sdk-mods"
+Changelog = ""
 
-[tool.mods_base]
-requirements_txt_path = "requirements.txt"
+[tool.sdkmod]
+name = "AutoLoot"
+version = "2.0.1"
+license = {name = "GPL3", url = "https://choosealicense.com/licenses/gpl-3.0/" }
+download = "https://github.com/galqawala/AutoLoot/raw/refs/heads/master/AutoLoot.sdkmod"
