@@ -1,7 +1,7 @@
 [project]
 name = "autoloot"
 version = "1.0.0"
-authors = [{ name = "Q Developer" }]
+authors = [{ name = "galqawala" }]
 description = """\
 Automatically picks up weapons and items with configurable options.
 
