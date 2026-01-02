@@ -1,17 +1,17 @@
-[project]
-name = "autoloot"
-version = "1.0.3"
-authors = [{ name = "galqawala" }]
-description = """\
-Automatically picks up weapons and items with configurable options.
+[build-system]
+requires = ["mods_base"]
 
-Features smart tracking to avoid re-picking items you've already seen or dropped.
-"""
+[project]
+name = "AutoLoot"
+version = "2.0.1"
+authors = [{name = "galqawala"}]
+description = "Automatically picks up weapons and items with configurable options"
+readme = {text = "Automatically picks up weapons and items with configurable options", content-type = "text/plain"}
+requires-python = ">=3.11"
+keywords = ["bl-sdk"]
 
 [project.urls]
-Repository = "https://github.com/galqawala/AutoLoot"
+Repository = "https://github.com/bl-sdk/bl-sdk-mods"
 
-[tool.sdkmod]
-name = "AutoLoot"
-license = {name = "MIT", url = "https://choosealicense.com/licenses/mit/" }
-download = "https://raw.githubusercontent.com/galqawala/AutoLoot/refs/heads/master/autoloot.sdkmod"
+[tool.mods_base]
+requirements_txt_path = "requirements.txt"
