@@ -14,4 +14,4 @@ Repository = "https://github.com/galqawala/AutoLoot"
 [tool.sdkmod]
 name = "AutoLoot"
 license = {name = "MIT", url = "https://choosealicense.com/licenses/mit/" }
-download = "https://github.com/galqawala/AutoLoot/releases/latest/download/autoloot.sdkmod"
+download = "https://raw.githubusercontent.com/galqawala/AutoLoot/refs/heads/master/autoloot.sdkmod"
