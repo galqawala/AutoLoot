@@ -5,9 +5,9 @@ An automatic loot pickup mod for Borderlands: The Pre-Sequel that intelligently 
 ## Features
 
 - **Configurable Item Types**: Toggle pickup for weapons, shields, grenades, class mods, artifacts, and customizations
-- **Smart Tracking**: Remembers items you've picked up or had in your inventory to avoid re-picking dropped items
-- **Performance Optimized**: Runs pickup checks every 60 ticks and inventory scans every 5 seconds
-- **Distance-Based**: Only picks up items within your normal interaction range
+- **Smart Tracking**: Remembers items that have been in your inventory, so anything you deliberately drop is left alone
+- **Adjustable Range**: Picks up within a configurable multiple of your normal interaction distance (2x by default)
+- **Clears a whole pile at once**: Everything in range is collected in a single pass, and another pass runs immediately afterwards while there is still loot to take
 
 ## Installation
 
@@ -24,8 +24,14 @@ Each item type can be toggled on/off:
 - Pickup Artifacts (Default: On)
 - Pickup Customizations (Default: On)
 
+Plus **Pickup Range Multiplier** (Default: 2x, range 1x–5x).
+
 ## How It Works
 
-The mod tracks unique IDs of items you've seen in your inventory and items you've picked up. When it encounters a pickup, it checks if the item's unique ID is in the "seen" list. If not, and the item type is enabled, it will automatically pick up the item.
+The mod tracks the unique IDs of items that have been in your inventory. When it sees a
+pickup whose ID isn't on that list, and its type is enabled, it collects it. That's what
+keeps it from re-collecting anything you deliberately dropped.
 
-This prevents the mod from picking up items you've intentionally dropped while still collecting new loot.
+Being *in your inventory* is the only thing that marks an item as seen — merely trying to
+pick something up does not. So an item you couldn't take because your backpack was full is
+picked up normally later, once you have room for it.
