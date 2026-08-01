@@ -1,8 +1,14 @@
 import math
+import re
 
-from mods_base import BoolOption, SliderOption, build_mod, hook
+from mods_base import BoolOption, DropdownOption, Game, SliderOption, build_mod, hook
+from ui_utils import show_hud_message
 from unrealsdk import logging
 from unrealsdk.hooks import Block, Type
+
+# TPS calls them Oz Kits, BL2 calls them Relics, and the class is WillowArtifact
+# in both. Derived once so the option and the summary cannot disagree.
+ARTIFACT_LABEL = "Oz Kits" if Game.get_current() == Game.TPS else "Relics"
 
 # PlayerTick fires once per frame, so this is roughly a fifth of a second. A pass
 # that actually collects something rescans on the very next tick instead, so a
@@ -13,40 +19,150 @@ FAST_SCAN_INTERVAL = 1
 ticks_until_scan = 0
 seen_unique_ids = set()
 picking_up = False
+collected_last_pass = False
 
 pickup_weapons = BoolOption("Pickup Weapons", True)
 pickup_shields = BoolOption("Pickup Shields", True)
 pickup_grenades = BoolOption("Pickup Grenades", True)
-pickup_class_mods = BoolOption("Pickup Class Mods", True)
-pickup_artifacts = BoolOption("Pickup Artifacts", True)
-pickup_customizations = BoolOption("Pickup Customizations", True)
-range_multiplier = SliderOption(
-    "Pickup Range Multiplier",
-    2.0,
-    1.0,
-    5.0,
-    0.5,
-    False,
+pickup_artifacts = BoolOption(f"Pickup {ARTIFACT_LABEL}", True)
+
+# Two categories can be worthless to you rather than merely unwanted, so they get
+# a middle choice instead of an on/off. The two ends mean the same thing in both,
+# so they are named once here; only the middle differs.
+CHOICE_ALL = "All"
+CHOICE_NONE = "None"
+
+CUSTOMIZATIONS_NEW = "New only"
+CLASS_MODS_MINE = "My class"
+
+# Substrings identifying an inventory class. Named once because both the pickup
+# filters and the backpack summary match on them, and a category that drifted
+# between the two would be collected but never counted.
+WEAPON_CLASS_TOKEN = "Weapon"
+SHIELD_CLASS_TOKEN = "Shield"
+GRENADE_CLASS_TOKEN = "Grenade"
+ARTIFACT_CLASS_TOKEN = "Artifact"
+CLASS_MOD_CLASS_TOKEN = "ClassMod"
+CUSTOMIZATION_CLASS_TOKEN = "UsableCustomization"
+
+# The seconds double as the on/off switch - a separate checkbox could disagree
+# with a duration of zero, leaving two controls for one decision. The two outputs
+# are independent of each other, so either, both or neither can be on.
+hud_summary_seconds = SliderOption(
+    "Backpack HUD Summary Seconds",
+    10,
+    0,
+    60,
+    1,
+    True,
     description=(
-        "How far AutoLoot reaches, as a multiple of your normal pickup range."
-        " Only automatic pickups are affected - picking things up yourself"
-        " still works exactly as before."
+        "After clearing a pile of loot, show what your backpack now holds on"
+        " screen, for this many seconds. Set to 0 to not show it on screen at"
+        " all. Shown once the pile is cleared, not once per item."
+    ),
+)
+summary_in_console = BoolOption(
+    "Backpack Summary In Console",
+    True,
+    description="Write the same summary to the SDK console.",
+)
+
+pickup_customizations = DropdownOption(
+    "Pickup Customizations",
+    CUSTOMIZATIONS_NEW,
+    [CHOICE_ALL, CUSTOMIZATIONS_NEW, CHOICE_NONE],
+    description=(
+        "Skins and heads. \"New only\" leaves behind the ones you have already"
+        " unlocked, since picking those up gains you nothing."
+    ),
+)
+auto_use_customizations = BoolOption(
+    "Auto Use Customizations",
+    True,
+    description=(
+        "Use customizations as soon as you pick them up, unlocking the skin or"
+        " head without a trip to the backpack. Note this consumes the item, so"
+        " you cannot pass it to another player afterwards."
+    ),
+)
+pickup_class_mods = DropdownOption(
+    "Pickup Class Mods",
+    CLASS_MODS_MINE,
+    [CHOICE_ALL, CLASS_MODS_MINE, CHOICE_NONE],
+    description=(
+        "\"My class\" leaves behind class mods your character cannot equip."
+        " Pick \"All\" if you collect them for your other characters."
+    ),
+)
+# Whole percent rather than a fractional multiplier: willow2-mod-menu logs
+# "non-integer slider, which willow2-mod-menu does not support due to engine
+# limitations" and cannot render one, so a float slider is unusable in game.
+range_percent = SliderOption(
+    "Pickup Range %",
+    100,
+    100,
+    500,
+    25,
+    True,
+    description=(
+        "How far AutoLoot reaches, against your normal pickup range. 100% is"
+        " the standard distance, 200% is twice as far. Only automatic pickups"
+        " are affected - picking things up yourself still works as before."
     ),
 )
 
-# Each option paired with the substring of the inventory class name it enables.
-# Keeping the pair together means adding a category is one row, not a new branch.
+# Each on/off option paired with the substring of the inventory class name it
+# enables. Keeping the pair together means adding a category is one row, not a
+# new branch. Customizations and class mods are deliberately absent - they are
+# three-way choices, handled in should_pickup below.
 PICKUP_FILTERS = (
     (pickup_weapons, "Weapon"),
     (pickup_shields, "Shield"),
     (pickup_grenades, "Grenade"),
-    (pickup_class_mods, "ClassMod"),
     (pickup_artifacts, "Artifact"),
-    (pickup_customizations, "UsableCustomization"),
 )
 
 
-def should_pickup(class_name: str) -> bool:
+def is_already_unlocked(inventory, caller) -> bool:
+    """Whether the player already owns this customization.
+
+    WillowUsableCustomizationItem.IsUsefulToThisPlayer returns false for exactly
+    those customizations WillowCustomizationManager.IsCustomizationUnlocked
+    reports as unlocked, so let the game answer instead of reimplementing the
+    profile lookup.
+    """
+    return not inventory.IsUsefulToThisPlayer(caller)
+
+
+def is_for_my_class(inventory, caller) -> bool:
+    """Whether this character can equip this class mod.
+
+    The same test the game itself applies in WillowItem.IsPlayerRestricted.
+    Deliberately not WillowInventory.CanBeUsedBy, which looks like the obvious
+    call but additionally returns false for every equippable item while the
+    player is riding a vehicle - which would strand class mods on the ground for
+    as long as you stayed in the moonbuggy.
+    """
+    return inventory.DefinitionData.ItemDefinition.PlayerClassRequirementMet(caller)
+
+
+def should_pickup(inventory, caller) -> bool:
+    class_name = inventory.Class.Name
+
+    if CUSTOMIZATION_CLASS_TOKEN in class_name:
+        if pickup_customizations.value == CHOICE_NONE:
+            return False
+        if pickup_customizations.value == CHOICE_ALL:
+            return True
+        return not is_already_unlocked(inventory, caller)
+
+    if CLASS_MOD_CLASS_TOKEN in class_name:
+        if pickup_class_mods.value == CHOICE_NONE:
+            return False
+        if pickup_class_mods.value == CHOICE_ALL:
+            return True
+        return is_for_my_class(inventory, caller)
+
     return any(option.value and token in class_name for option, token in PICKUP_FILTERS)
 
 
@@ -88,24 +204,174 @@ def update_seen_ids(caller):
             item = item.Inventory
 
 
+def use_customizations(caller):
+    """Consume backpack customizations, unlocking the skin or head each carries.
+
+    The same sequence the backpack screen runs when you pick "Use": check the
+    item is consumable and its DLC requirement is met, then TryConsume, which
+    unlocks it and destroys the item. TryConsume refuses and returns false when
+    the customization is already unlocked, so a duplicate is never spent.
+    """
+    if not auto_use_customizations.value:
+        return
+
+    inventory_manager = caller.GetPawnInventoryManager()
+    if inventory_manager is None:
+        return
+
+    # Snapshot: consuming removes the item from the very list being walked.
+    for item in list(inventory_manager.Backpack):
+        try:
+            if item is None or item.Class is None:
+                continue
+            if CUSTOMIZATION_CLASS_TOKEN not in item.Class.Name:
+                continue
+            if not item.IsConsumable():
+                continue
+            if not item.IsDLCRequirementMet(caller):
+                continue
+            item.TryConsume()
+        except Exception as ex:  # noqa: BLE001
+            logging.dev_warning(f"[AutoLoot] could not use a customization: {ex!r}")
+
+
 def dist(a, b) -> float:
     return math.sqrt((b.X - a.X) ** 2 + (b.Y - a.Y) ** 2 + (b.Z - a.Z) ** 2)
 
 
+# Class-name token paired with the label the summary lists it under. Weapons are
+# absent deliberately: they are grouped by ammo type instead, and that comes from
+# the game rather than from any table here, because BL2 and TPS do not share the
+# same ammo (TPS adds lasers) and either could be modded to add more.
+GEAR_CATEGORIES = (
+    (SHIELD_CLASS_TOKEN, "Shields"),
+    (GRENADE_CLASS_TOKEN, "Grenade Mods"),
+    (CLASS_MOD_CLASS_TOKEN, "Class Mods"),
+    (ARTIFACT_CLASS_TOKEN, ARTIFACT_LABEL),
+    (CUSTOMIZATION_CLASS_TOKEN, "Customizations"),
+)
+
+# Plain ASCII: the HUD's Scaleform font has no glyph for a middle dot and drew a
+# square box for it instead. Anything beyond ASCII here needs checking in game.
+SUMMARY_SEPARATOR = " | "
+
+
+def prettify_ammo_name(name: str) -> str:
+    """Turn a resource's object name into something readable.
+
+    The game is not consistent about it - both `Ammo_Combat_Rifle` and
+    `Ammo_CombatRifle` appear - so handle underscores and camel case, and give
+    back `Combat Rifle` either way.
+    """
+    name = str(name).removeprefix("Ammo_").replace("_", " ")
+    return re.sub(r"(?<=[a-z])(?=[A-Z])", " ", name)
+
+
+def ammo_label(weapon) -> str:
+    """Which ammo pool this weapon draws from.
+
+    Read off the weapon's own AmmoResource rather than mapped from a weapon-type
+    enum: the enum's members differ per game (index 6 is WT_Laser in TPS but
+    WT_MAX in BL2), so a fixed table would confidently mislabel one of them.
+    """
+    weapon_type = weapon.DefinitionData.WeaponTypeDefinition
+    resource = None if weapon_type is None else weapon_type.AmmoResource
+    if resource is None:
+        return "Other"
+    return prettify_ammo_name(resource.Name)
+
+
+def backpack_tally(caller):
+    """Count the backpack, ammo types and gear categories together in one tally.
+
+    One tally rather than two, because the summary lists them as a single run:
+    keeping them apart would only let the two halves be ordered by different
+    rules. Returns `(counts, used, capacity)`, or None if there is no inventory
+    to read. `used` and `capacity` are the game's own two numbers rather than
+    anything derived here.
+    """
+    inventory_manager = caller.GetPawnInventoryManager()
+    if inventory_manager is None:
+        return None
+
+    counts = {}
+    for item in inventory_manager.Backpack:
+        if item is None or item.Class is None:
+            continue
+        class_name = item.Class.Name
+        if WEAPON_CLASS_TOKEN in class_name:
+            label = ammo_label(item)
+        else:
+            label = next(
+                (label for token, label in GEAR_CATEGORIES if token in class_name),
+                None,
+            )
+            if label is None:
+                continue
+        counts[label] = counts.get(label, 0) + 1
+
+    return (
+        counts,
+        inventory_manager.CountUnreadiedInventory(),
+        inventory_manager.GetUnreadiedInventoryMaxSize(),
+    )
+
+
+def summary_line(counts) -> str:
+    """One line of `Label N`, most first, empty categories left out.
+
+    Ties break on the label so the same backpack always reads the same way -
+    otherwise the order would depend on where things happen to sit in the bag.
+    """
+    ordered = sorted(counts.items(), key=lambda pair: (-pair[1], pair[0]))
+    return SUMMARY_SEPARATOR.join(f"{label} {count}" for label, count in ordered if count)
+
+
+def format_tally(counts, used, capacity):
+    """A title plus one line holding everything, biggest group first."""
+    return f"Backpack  {used}/{capacity}", summary_line(counts)
+
+
+def report_backpack(caller):
+    if not (hud_summary_seconds.value or summary_in_console.value):
+        return
+    try:
+        tally = backpack_tally(caller)
+        if tally is None:
+            return
+        title, body = format_tally(*tally)
+        if not body:
+            return
+        if summary_in_console.value:
+            logging.info(f"{title}\n{body}")
+        if hud_summary_seconds.value:
+            show_hud_message(title, body, hud_summary_seconds.value)
+    except Exception as ex:  # noqa: BLE001
+        logging.dev_warning(f"[AutoLoot] could not summarise the backpack: {ex!r}")
+
+
 @hook("WillowGame.WillowPlayerController:PlayerTick", Type.POST)
 def player_tick(obj, _args, _ret, _func):
-    global ticks_until_scan, picking_up
+    global ticks_until_scan, picking_up, collected_last_pass
 
     ticks_until_scan -= 1
     if ticks_until_scan > 0:
         return
 
+    # PlayerTick also fires while a level is still loading, before the pawn
+    # exists. Nothing below is meaningful then - there is no one to give loot
+    # to, and CalcViewActorLocation has no pawn to read a viewpoint from.
+    willow_globals = obj.GetWillowGlobals()
+    if obj.Pawn is None or willow_globals is None:
+        ticks_until_scan = SCAN_INTERVAL
+        return
+
     update_seen_ids(obj)
 
-    willow_globals = obj.GetWillowGlobals()
     max_dist = (
         willow_globals.GetGlobalsDefinition().PlayerInteractionDistance
-        * range_multiplier.value
+        * range_percent.value
+        / 100
     )
     view_location = obj.CalcViewActorLocation
     collected_any = False
@@ -120,12 +386,21 @@ def player_tick(obj, _args, _ret, _func):
             inventory = pickup.Inventory
             if inventory is None or inventory.Class is None:
                 continue
-            if not should_pickup(inventory.Class.Name):
-                continue
             if unique_id_of(inventory) in seen_unique_ids:
                 continue
             if dist(pickup.Location, view_location) > max_dist:
                 continue
+            # Last, because deciding about a customization calls into the game.
+            if not should_pickup(inventory, obj):
+                continue
+
+            # A collected pickup is destroyed inside this call, and Destroyed()
+            # takes it out of PickupList. Read success off the list's length
+            # rather than off the pickup: touching a property of an actor the
+            # engine has just destroyed reads memory we no longer own, and the
+            # answer is the same either way. This only decides whether to rescan
+            # early - a refusal must not pin us to the fast interval.
+            count_before = len(willow_globals.PickupList)
 
             picking_up = True
             try:
@@ -133,19 +408,28 @@ def player_tick(obj, _args, _ret, _func):
             finally:
                 picking_up = False
 
-            # DroppedPickup.GiveTo clears Inventory before the actor is destroyed,
-            # all synchronously inside the call above, so an emptied pickup is one
-            # we genuinely got. Anything refused still holds its inventory and is
-            # simply retried on a later pass. Note this only decides whether to
-            # rescan early - a refusal must not pin us to the fast interval.
-            if pickup.Inventory is None:
+            if len(willow_globals.PickupList) < count_before:
                 collected_any = True
         except Exception as ex:  # noqa: BLE001
-            # The snapshot can outlive its entries; one stale pickup must not
-            # abandon the rest of the pass.
+            # One bad entry must not abandon the rest of the pass.
             logging.dev_warning(f"[AutoLoot] skipped a pickup: {ex!r}")
 
+    # After collecting, so anything picked up this pass is used straight away and
+    # the summary below already reflects it being gone.
+    use_customizations(obj)
+
     ticks_until_scan = FAST_SCAN_INTERVAL if collected_any else SCAN_INTERVAL
+
+    # Report when the pile is finished rather than per item. show_hud_message
+    # drops messages shown too close together, and one message per gun would be
+    # unreadable anyway. A collecting pass rescans on the very next tick, so the
+    # first pass that takes nothing lands almost immediately after the last one
+    # that did.
+    if collected_any:
+        collected_last_pass = True
+    elif collected_last_pass:
+        collected_last_pass = False
+        report_backpack(obj)
 
 
 # Suppress the "inventory full" toast and the item's rejection hop, but only for
@@ -162,4 +446,23 @@ def block_failed_pickup(_obj, _args, _ret, _func):
     return Block if picking_up else None
 
 
-build_mod()
+# Listed explicitly, and in the order they should appear. Left to itself,
+# build_mod discovers options with inspect.getmembers, which sorts by *variable
+# name* - which put "hud_summary_seconds" first in the menu and
+# "summary_in_console" last, with everything else between the two halves of one
+# setting. Anything added here must be added to this list or it never renders,
+# which test_every_option_appears_in_the_menu_list checks.
+MOD_OPTIONS = [
+    pickup_weapons,
+    pickup_shields,
+    pickup_grenades,
+    pickup_artifacts,
+    pickup_class_mods,
+    pickup_customizations,
+    auto_use_customizations,
+    range_percent,
+    hud_summary_seconds,
+    summary_in_console,
+]
+
+build_mod(options=MOD_OPTIONS)

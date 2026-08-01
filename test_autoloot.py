@@ -13,6 +13,7 @@ it proves the fake can actually expose the skipping bug, so a pass from
 test_collects_every_pickup_in_one_call means something.
 """
 
+import enum
 import importlib.util
 import sys
 import types
@@ -30,7 +31,27 @@ def _install_sdk_stubs():
 
     mods_base.BoolOption = _Option
     mods_base.SliderOption = _Option
+    mods_base.DropdownOption = _Option
     mods_base.build_mod = lambda *_a, **_k: None
+
+    class Game(enum.Flag):
+        BL2 = enum.auto()
+        TPS = enum.auto()
+
+        @staticmethod
+        def get_current():
+            return Game.TPS
+
+    mods_base.Game = Game
+
+    ui_utils = types.ModuleType("ui_utils")
+    ui_utils.shown = []
+    # Record the duration too: a setting that never reaches the call it configures
+    # looks identical to one that works, from every other assertion here.
+    ui_utils.show_hud_message = lambda title, msg, duration=2.5: ui_utils.shown.append(
+        (title, msg, duration)
+    )
+    sys.modules["ui_utils"] = ui_utils
 
     def _hook(_name, _type=None):
         # Return the plain function so tests can call it directly.
@@ -41,6 +62,8 @@ def _install_sdk_stubs():
     unrealsdk = types.ModuleType("unrealsdk")
     logging_mod = types.ModuleType("unrealsdk.logging")
     logging_mod.dev_warning = lambda *a, **k: None
+    logging_mod.logged = []
+    logging_mod.info = lambda *args: logging_mod.logged.append(" ".join(map(str, args)))
     hooks_mod = types.ModuleType("unrealsdk.hooks")
 
     class Block:
@@ -87,22 +110,126 @@ class FakeClass:
         self.Name = name
 
 
+class FakeItemDefinition:
+    def __init__(self, my_class=True):
+        self.my_class = my_class
+
+    def PlayerClassRequirementMet(self, _pc):
+        return self.my_class
+
+
+class FakeResource:
+    def __init__(self, name):
+        self.Name = name
+
+
+class FakeWeaponTypeDefinition:
+    def __init__(self, ammo_name):
+        self.AmmoResource = None if ammo_name is None else FakeResource(ammo_name)
+
+
 class FakeDefinitionData:
-    def __init__(self, unique_id):
+    def __init__(self, unique_id, my_class=True, ammo="Ammo_Repeater_Pistol"):
         self.UniqueId = unique_id
+        self.ItemDefinition = FakeItemDefinition(my_class)
+        self.WeaponTypeDefinition = FakeWeaponTypeDefinition(ammo)
+
+
+CUSTOMIZATION_CLASS = "WillowUsableCustomizationItem"
+CLASS_MOD_CLASS = "WillowClassMod"
 
 
 class FakeInventory:
-    def __init__(self, unique_id, class_name="WillowWeapon"):
+    def __init__(
+        self,
+        unique_id,
+        class_name="WillowWeapon",
+        useful=True,
+        my_class=True,
+        ammo="Ammo_Repeater_Pistol",
+    ):
         self.Class = FakeClass(class_name)
-        self.DefinitionData = FakeDefinitionData(unique_id)
+        self.DefinitionData = FakeDefinitionData(unique_id, my_class, ammo)
         self.Inventory = None  # next link when held in an equipped chain
+        self.useful = useful
+        self.dlc_met = True
+        self.consumed = False
+        self.backpack = None  # set once it is sitting in someone's backpack
+
+    def IsUsefulToThisPlayer(self, _pc):
+        # False for an already-unlocked customization, as the game reports it.
+        return self.useful
+
+    def IsConsumable(self):
+        return CUSTOMIZATION_CLASS in self.Class.Name
+
+    def IsDLCRequirementMet(self, _pc):
+        return self.dlc_met
+
+    def TryConsume(self):
+        """WillowUsableCustomizationItem.TryConsume: refuses an already-unlocked one."""
+        if not self.useful:
+            return False
+        if self.backpack is not None:
+            self.backpack.remove(self)
+        self.consumed = True
+        return True
+
+
+class TouchedDestroyedPickup(BaseException):
+    """Deliberately not an Exception, so the mod's own except cannot swallow it."""
 
 
 class FakePickup:
-    def __init__(self, unique_id, class_name="WillowWeapon", distance=0.0):
-        self.Inventory = FakeInventory(unique_id, class_name)
-        self.Location = Vec(distance, 0.0, 0.0)
+    """A WillowPickup that reports being read after the engine destroyed it.
+
+    Reading a property of a destroyed actor is reading memory the game has
+    handed back, which is a plausible route to a native crash rather than a
+    Python traceback. Making it loud here is the only way to keep it out.
+    """
+
+    def __init__(
+        self,
+        unique_id,
+        class_name="WillowWeapon",
+        distance=0.0,
+        useful=True,
+        my_class=True,
+        ammo="Ammo_Repeater_Pistol",
+    ):
+        self._inventory = FakeInventory(unique_id, class_name, useful, my_class, ammo)
+        self._location = Vec(distance, 0.0, 0.0)
+        self.destroyed = False
+
+    def _assert_alive(self):
+        if self.destroyed:
+            raise TouchedDestroyedPickup(
+                "read a property of a WillowPickup the engine already destroyed"
+            )
+
+    @property
+    def Inventory(self):
+        self._assert_alive()
+        return self._inventory
+
+    @Inventory.setter
+    def Inventory(self, value):
+        self._inventory = value
+
+    @property
+    def Location(self):
+        self._assert_alive()
+        return self._location
+
+
+def customization(unique_id, unlocked):
+    """A customization pickup; unlocked ones are the worthless duplicates."""
+    return FakePickup(unique_id, CUSTOMIZATION_CLASS, useful=not unlocked)
+
+
+def class_mod(unique_id, mine):
+    """A class mod pickup; `mine` is whether this character can equip it."""
+    return FakePickup(unique_id, CLASS_MOD_CLASS, my_class=mine)
 
 
 class FakeGlobalsDefinition:
@@ -128,6 +255,12 @@ class FakeInventoryManager:
     InventoryChain = None
     ItemChain = None
 
+    def CountUnreadiedInventory(self):
+        return len(self.Backpack)
+
+    def GetUnreadiedInventoryMaxSize(self):
+        return self.capacity
+
 
 class FakePawn:
     def __init__(self, inv_manager):
@@ -139,6 +272,8 @@ class FakePlayerController:
 
     def __init__(self, pickups, capacity=99, backpack=None):
         self.inv_manager = FakeInventoryManager(list(backpack or []), capacity)
+        for item in self.inv_manager.Backpack:
+            item.backpack = self.inv_manager.Backpack
         self.Pawn = FakePawn(self.inv_manager)
         self.willow_globals = FakeWillowGlobals(pickups)
         self.CalcViewActorLocation = Vec(0.0, 0.0, 0.0)
@@ -154,9 +289,12 @@ class FakePlayerController:
         self.attempts += 1
         if len(self.inv_manager.Backpack) >= self.inv_manager.capacity:
             return  # no room: pickup keeps its Inventory and stays in the world
-        self.inv_manager.Backpack.append(pickup.Inventory)
-        pickup.Inventory = None  # DroppedPickup.GiveTo
+        collected = pickup.Inventory
+        collected.backpack = self.inv_manager.Backpack
+        self.inv_manager.Backpack.append(collected)
+        pickup.Inventory = None  # DroppedPickup.GiveTo clears it, then...
         self.willow_globals.PickupList.remove(pickup)  # Destroyed -> RemovePickup
+        pickup.destroyed = True  # ...the actor itself is gone
 
 
 def run_one_scan(pc):
@@ -170,7 +308,15 @@ class AutoLootTests(unittest.TestCase):
         autoloot.seen_unique_ids.clear()
         autoloot.ticks_until_scan = 0
         autoloot.picking_up = False
-        autoloot.range_multiplier.value = 1.0
+        autoloot.range_percent.value = 100
+        autoloot.pickup_customizations.value = autoloot.CHOICE_ALL
+        autoloot.pickup_class_mods.value = autoloot.CHOICE_ALL
+        autoloot.hud_summary_seconds.value = 0
+        autoloot.summary_in_console.value = False
+        autoloot.auto_use_customizations.value = False
+        autoloot.collected_last_pass = False
+        sys.modules["ui_utils"].shown.clear()
+        sys.modules["unrealsdk.logging"].logged.clear()
         for option, _token in autoloot.PICKUP_FILTERS:
             option.value = True
 
@@ -230,14 +376,14 @@ class AutoLootTests(unittest.TestCase):
         run_one_scan(pc)
         self.assertEqual(autoloot.ticks_until_scan, autoloot.FAST_SCAN_INTERVAL)
 
-    def test_range_multiplier_extends_reach(self):
+    def test_range_percent_extends_reach(self):
         just_out_of_reach = BASE_INTERACTION_DISTANCE * 1.5
         pc = FakePlayerController([FakePickup(1, distance=just_out_of_reach)])
 
         run_one_scan(pc)
-        self.assertEqual(pc.attempts, 0, "should be out of range at 1x")
+        self.assertEqual(pc.attempts, 0, "should be out of range at 100%")
 
-        autoloot.range_multiplier.value = 2.0
+        autoloot.range_percent.value = 200
         run_one_scan(pc)
         self.assertEqual(pc.willow_globals.PickupList, [])
 
@@ -248,6 +394,340 @@ class AutoLootTests(unittest.TestCase):
                 option.value = False
         run_one_scan(pc)
         self.assertEqual(pc.attempts, 0)
+
+    # --- customization modes ---
+
+    def test_new_only_leaves_already_unlocked_customizations(self):
+        autoloot.pickup_customizations.value = autoloot.CUSTOMIZATIONS_NEW
+        pc = FakePlayerController([customization(1, unlocked=True)])
+        run_one_scan(pc)
+        self.assertEqual(pc.attempts, 0)
+        self.assertEqual(len(pc.willow_globals.PickupList), 1)
+
+    def test_new_only_still_takes_new_customizations(self):
+        autoloot.pickup_customizations.value = autoloot.CUSTOMIZATIONS_NEW
+        pc = FakePlayerController([customization(1, unlocked=False)])
+        run_one_scan(pc)
+        self.assertEqual(pc.willow_globals.PickupList, [])
+
+    def test_all_takes_customizations_it_already_owns(self):
+        autoloot.pickup_customizations.value = autoloot.CHOICE_ALL
+        pc = FakePlayerController([customization(1, unlocked=True)])
+        run_one_scan(pc)
+        self.assertEqual(pc.willow_globals.PickupList, [])
+
+    def test_none_leaves_every_customization(self):
+        autoloot.pickup_customizations.value = autoloot.CHOICE_NONE
+        pc = FakePlayerController(
+            [customization(1, unlocked=False), customization(2, unlocked=True)]
+        )
+        run_one_scan(pc)
+        self.assertEqual(pc.attempts, 0)
+        self.assertEqual(len(pc.willow_globals.PickupList), 2)
+
+    def test_customization_mode_does_not_affect_other_categories(self):
+        autoloot.pickup_customizations.value = autoloot.CHOICE_NONE
+        pc = FakePlayerController([FakePickup(1)])  # a weapon
+        run_one_scan(pc)
+        self.assertEqual(pc.willow_globals.PickupList, [])
+
+    # --- class mod modes ---
+
+    def test_my_class_leaves_other_characters_class_mods(self):
+        autoloot.pickup_class_mods.value = autoloot.CLASS_MODS_MINE
+        pc = FakePlayerController([class_mod(1, mine=False)])
+        run_one_scan(pc)
+        self.assertEqual(pc.attempts, 0)
+        self.assertEqual(len(pc.willow_globals.PickupList), 1)
+
+    def test_my_class_takes_ones_this_character_can_equip(self):
+        autoloot.pickup_class_mods.value = autoloot.CLASS_MODS_MINE
+        pc = FakePlayerController([class_mod(1, mine=True)])
+        run_one_scan(pc)
+        self.assertEqual(pc.willow_globals.PickupList, [])
+
+    def test_all_takes_class_mods_for_any_character(self):
+        autoloot.pickup_class_mods.value = autoloot.CHOICE_ALL
+        pc = FakePlayerController([class_mod(1, mine=False)])
+        run_one_scan(pc)
+        self.assertEqual(pc.willow_globals.PickupList, [])
+
+    def test_none_leaves_every_class_mod(self):
+        autoloot.pickup_class_mods.value = autoloot.CHOICE_NONE
+        pc = FakePlayerController([class_mod(1, mine=True), class_mod(2, mine=False)])
+        run_one_scan(pc)
+        self.assertEqual(pc.attempts, 0)
+        self.assertEqual(len(pc.willow_globals.PickupList), 2)
+
+    def test_class_mod_mode_does_not_affect_other_categories(self):
+        autoloot.pickup_class_mods.value = autoloot.CHOICE_NONE
+        pc = FakePlayerController([FakePickup(1)])  # a weapon
+        run_one_scan(pc)
+        self.assertEqual(pc.willow_globals.PickupList, [])
+
+    def test_the_two_dropdowns_are_independent(self):
+        """A class mod is not a customization and must not be judged as one."""
+        autoloot.pickup_class_mods.value = autoloot.CHOICE_NONE
+        autoloot.pickup_customizations.value = autoloot.CHOICE_ALL
+        pc = FakePlayerController([customization(1, unlocked=True), class_mod(2, mine=True)])
+        run_one_scan(pc)
+        self.assertEqual(len(pc.willow_globals.PickupList), 1, "class mod should remain")
+        self.assertEqual(len(pc.inv_manager.Backpack), 1)
+
+    # --- auto use customizations ---
+
+    def test_auto_use_consumes_a_new_customization(self):
+        autoloot.auto_use_customizations.value = True
+        skin = FakeInventory(1, CUSTOMIZATION_CLASS, useful=True)
+        pc = FakePlayerController([], backpack=[skin])
+        run_one_scan(pc)
+        self.assertTrue(skin.consumed)
+        self.assertEqual(pc.inv_manager.Backpack, [])
+
+    def test_auto_use_picks_up_then_uses_in_the_same_pass(self):
+        autoloot.auto_use_customizations.value = True
+        pc = FakePlayerController([customization(1, unlocked=False)])
+        run_one_scan(pc)
+        self.assertEqual(pc.willow_globals.PickupList, [], "should have collected it")
+        self.assertEqual(pc.inv_manager.Backpack, [], "and used it straight away")
+
+    def test_auto_use_covers_customizations_from_any_source(self):
+        """It scans the backpack, so a mission or challenge reward counts too.
+
+        Nothing is on the ground and pickup is switched off entirely, yet the
+        skin still gets used - the two settings are independent.
+        """
+        autoloot.auto_use_customizations.value = True
+        autoloot.pickup_customizations.value = autoloot.CHOICE_NONE
+        reward = FakeInventory(1, CUSTOMIZATION_CLASS, useful=True)
+        pc = FakePlayerController([], backpack=[reward])
+        run_one_scan(pc)
+        self.assertTrue(reward.consumed)
+
+    def test_auto_use_does_not_spend_an_already_unlocked_one(self):
+        """TryConsume refuses these itself, so the duplicate survives."""
+        autoloot.auto_use_customizations.value = True
+        dupe = FakeInventory(1, CUSTOMIZATION_CLASS, useful=False)
+        pc = FakePlayerController([], backpack=[dupe])
+        run_one_scan(pc)
+        self.assertFalse(dupe.consumed)
+        self.assertIn(dupe, pc.inv_manager.Backpack)
+
+    def test_auto_use_respects_the_dlc_requirement(self):
+        autoloot.auto_use_customizations.value = True
+        locked = FakeInventory(1, CUSTOMIZATION_CLASS, useful=True)
+        locked.dlc_met = False
+        pc = FakePlayerController([], backpack=[locked])
+        run_one_scan(pc)
+        self.assertFalse(locked.consumed)
+
+    def test_auto_use_off_leaves_customizations_alone(self):
+        autoloot.auto_use_customizations.value = False
+        skin = FakeInventory(1, CUSTOMIZATION_CLASS, useful=True)
+        pc = FakePlayerController([], backpack=[skin])
+        run_one_scan(pc)
+        self.assertFalse(skin.consumed)
+        self.assertIn(skin, pc.inv_manager.Backpack)
+
+    def test_auto_use_never_touches_anything_else(self):
+        autoloot.auto_use_customizations.value = True
+        gun = FakeInventory(1, "WillowWeapon")
+        mod = FakeInventory(2, CLASS_MOD_CLASS)
+        pc = FakePlayerController([], backpack=[gun, mod])
+        run_one_scan(pc)
+        self.assertEqual(pc.inv_manager.Backpack, [gun, mod])
+
+    def test_auto_use_consumes_every_customization_not_every_other_one(self):
+        """Consuming shortens the backpack - the same hazard as PickupList."""
+        autoloot.auto_use_customizations.value = True
+        skins = [FakeInventory(i, CUSTOMIZATION_CLASS, useful=True) for i in range(5)]
+        pc = FakePlayerController([], backpack=list(skins))
+        run_one_scan(pc)
+        self.assertTrue(all(skin.consumed for skin in skins))
+        self.assertEqual(pc.inv_manager.Backpack, [])
+
+    # --- backpack summary ---
+
+    def test_summary_is_shown_once_when_the_pile_is_cleared(self):
+        autoloot.hud_summary_seconds.value = 6
+        shown = sys.modules["ui_utils"].shown
+        pc = FakePlayerController([FakePickup(i) for i in range(3)], capacity=40)
+
+        run_one_scan(pc)  # collects the pile
+        self.assertEqual(shown, [], "must not report while still collecting")
+
+        run_one_scan(pc)  # nothing left: report now
+        self.assertEqual(len(shown), 1)
+
+        run_one_scan(pc)  # and not again on every later idle pass
+        self.assertEqual(len(shown), 1)
+
+    def test_summary_counts_weapons_by_ammo_and_gear_by_category(self):
+        autoloot.hud_summary_seconds.value = 6
+        backpack = [
+            FakeInventory(1, "WillowWeapon", ammo="Ammo_Repeater_Pistol"),
+            FakeInventory(2, "WillowWeapon", ammo="Ammo_Repeater_Pistol"),
+            FakeInventory(3, "WillowWeapon", ammo="Ammo_CombatRifle"),
+            FakeInventory(4, "WillowShield"),
+            FakeInventory(5, "WillowGrenadeMod"),
+            FakeInventory(6, "WillowClassMod"),
+            FakeInventory(7, "WillowArtifact"),
+        ]
+        pc = FakePlayerController([], capacity=39, backpack=backpack)
+        autoloot.collected_last_pass = True  # pretend a pile just finished
+        run_one_scan(pc)
+
+        title, body, _duration = sys.modules["ui_utils"].shown[0]
+        self.assertEqual(title, "Backpack  7/39")
+        self.assertIn("Pistol 2", body)
+        self.assertIn("Combat Rifle 1", body, "camel case ammo names must split")
+        self.assertIn("Shields 1", body)
+        self.assertIn("Grenade Mods 1", body)
+        self.assertIn("Class Mods 1", body)
+        self.assertIn(autoloot.ARTIFACT_LABEL + " 1", body)
+        self.assertNotIn("Customizations", body, "empty categories are left out")
+
+    def test_summary_ammo_names_come_from_the_game_not_a_table(self):
+        """TPS lasers and BL2's lack of them both fall out of reading AmmoResource."""
+        self.assertEqual(autoloot.prettify_ammo_name("Ammo_Laser"), "Laser")
+        self.assertEqual(
+            autoloot.prettify_ammo_name("Ammo_Combat_Rifle"), "Combat Rifle"
+        )
+        self.assertEqual(autoloot.prettify_ammo_name("Ammo_CombatRifle"), "Combat Rifle")
+        self.assertEqual(autoloot.prettify_ammo_name("Ammo_Patrol_SMG"), "Patrol SMG")
+
+    def test_summary_lines_are_sorted_by_amount(self):
+        """Most first, so the thing you have most of leads the line."""
+        line = autoloot.summary_line({"Pistol": 4, "Laser": 9, "SMG": 1, "Sniper": 0})
+        self.assertEqual(line, "Laser 9 | Pistol 4 | SMG 1")
+
+    def test_every_option_appears_in_the_menu_list(self):
+        """MOD_OPTIONS is explicit, so a new option left out of it never renders."""
+        option_type = sys.modules["mods_base"].BoolOption  # all stubs share a class
+        declared = {
+            name: value
+            for name, value in vars(autoloot).items()
+            if isinstance(value, option_type)
+        }
+        self.assertTrue(declared, "found no options at all - test is not working")
+        missing = [
+            name for name, value in declared.items() if value not in autoloot.MOD_OPTIONS
+        ]
+        self.assertEqual(missing, [], "these options would be invisible in game")
+
+    def test_related_summary_options_are_adjacent(self):
+        """They were rendering at opposite ends, sorted by variable name."""
+        identifiers = [option.identifier for option in autoloot.MOD_OPTIONS]
+        gap = abs(
+            identifiers.index(autoloot.hud_summary_seconds.identifier)
+            - identifiers.index(autoloot.summary_in_console.identifier)
+        )
+        self.assertEqual(gap, 1)
+
+    def test_weapons_and_gear_share_one_sorted_run(self):
+        """Gear outranks a weapon type when there is more of it, and vice versa."""
+        backpack = [
+            FakeInventory(1, "WillowShield"),
+            FakeInventory(2, "WillowShield"),
+            FakeInventory(3, "WillowShield"),
+            FakeInventory(4, "WillowWeapon", ammo="Ammo_Laser"),
+            FakeInventory(5, "WillowWeapon", ammo="Ammo_Laser"),
+            FakeInventory(6, "WillowClassMod"),
+        ]
+        pc = FakePlayerController([], capacity=39, backpack=backpack)
+        counts, used, capacity = autoloot.backpack_tally(pc)
+        _title, body = autoloot.format_tally(counts, used, capacity)
+
+        self.assertEqual(body, "Shields 3 | Laser 2 | Class Mods 1")
+        self.assertNotIn("\n", body, "everything belongs on one line now")
+
+    def test_equal_amounts_break_ties_by_name(self):
+        """Otherwise the order would vary with backpack layout, run to run."""
+        counts = {"Shotgun": 2, "Pistol": 2, "Laser": 2}
+        self.assertEqual(
+            autoloot.summary_line(counts), "Laser 2 | Pistol 2 | Shotgun 2"
+        )
+
+    def test_summary_duration_setting_reaches_the_hud(self):
+        autoloot.hud_summary_seconds.value = 11
+        pc = FakePlayerController([FakePickup(1)], capacity=39)
+        run_one_scan(pc)
+        run_one_scan(pc)
+        _title, _body, duration = sys.modules["ui_utils"].shown[0]
+        self.assertEqual(duration, 11)
+
+    def test_zero_seconds_disables_the_on_screen_summary(self):
+        autoloot.hud_summary_seconds.value = 0
+        autoloot.summary_in_console.value = True
+        pc = FakePlayerController([FakePickup(1)], capacity=39)
+        run_one_scan(pc)
+        run_one_scan(pc)
+        self.assertEqual(sys.modules["ui_utils"].shown, [])
+        self.assertEqual(len(sys.modules["unrealsdk.logging"].logged), 1)
+
+    def test_summary_text_is_pure_ascii(self):
+        """The HUD font drew a box for the middle dot that used to separate these."""
+        title, body = autoloot.format_tally({"Pistol": 2, "Shields": 1}, 3, 39)
+        for text in (title, body, autoloot.SUMMARY_SEPARATOR):
+            self.assertTrue(text.isascii(), f"non-ascii will render as boxes: {text!r}")
+
+    def test_both_outputs_can_be_on_at_once(self):
+        autoloot.hud_summary_seconds.value = 6
+        autoloot.summary_in_console.value = True
+        pc = FakePlayerController([FakePickup(1)], capacity=39)
+        run_one_scan(pc)
+        run_one_scan(pc)
+        self.assertEqual(len(sys.modules["ui_utils"].shown), 1)
+        self.assertEqual(len(sys.modules["unrealsdk.logging"].logged), 1)
+
+    def test_summary_off_shows_nothing(self):
+        autoloot.hud_summary_seconds.value = 0
+        autoloot.summary_in_console.value = False
+        pc = FakePlayerController([FakePickup(1)])
+        run_one_scan(pc)
+        run_one_scan(pc)
+        self.assertEqual(sys.modules["ui_utils"].shown, [])
+
+    def test_summary_console_mode_logs_instead_of_drawing(self):
+        autoloot.summary_in_console.value = True
+        pc = FakePlayerController([FakePickup(1)], capacity=39)
+        run_one_scan(pc)
+        run_one_scan(pc)
+        self.assertEqual(sys.modules["ui_utils"].shown, [])
+        self.assertEqual(len(sys.modules["unrealsdk.logging"].logged), 1)
+
+    def test_summary_is_not_shown_when_nothing_was_collected(self):
+        autoloot.hud_summary_seconds.value = 6
+        pc = FakePlayerController([])
+        run_one_scan(pc)
+        run_one_scan(pc)
+        self.assertEqual(sys.modules["ui_utils"].shown, [])
+
+    def test_never_reads_a_pickup_after_the_engine_destroys_it(self):
+        """FakePickup raises a BaseException if this is violated, so a plain pass
+        of the other tests already proves it - this states the rule explicitly."""
+        pc = FakePlayerController([FakePickup(i) for i in range(3)])
+        run_one_scan(pc)  # would raise TouchedDestroyedPickup
+        self.assertEqual(pc.willow_globals.PickupList, [])
+
+    def test_skips_the_pass_while_the_pawn_is_missing(self):
+        """PlayerTick fires during loading, before there is anyone to give loot to."""
+        pc = FakePlayerController([FakePickup(1)])
+        pc.Pawn = None
+        run_one_scan(pc)
+        self.assertEqual(pc.attempts, 0)
+        self.assertEqual(autoloot.ticks_until_scan, autoloot.SCAN_INTERVAL)
+
+    def test_nothing_is_ever_removed_from_the_backpack(self):
+        """AutoLoot only ever collects - it must never discard the player's items."""
+        held = [
+            FakeInventory(1, CUSTOMIZATION_CLASS, useful=False),  # already unlocked
+            FakeInventory(2, "WillowWeapon", useful=False),
+        ]
+        pc = FakePlayerController([], backpack=list(held))
+        autoloot.pickup_customizations.value = autoloot.CUSTOMIZATIONS_NEW
+        run_one_scan(pc)
+        self.assertEqual(pc.inv_manager.Backpack, held)
 
     def test_one_broken_pickup_does_not_abandon_the_pass(self):
         class ExplodingPickup:
