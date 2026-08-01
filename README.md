@@ -30,6 +30,7 @@ middle choice instead:
 - **Pickup Class Mods** — *All*, *My class*, or *None* (Default: My class)
 - **Pickup Customizations** — *All*, *New only*, or *None* (Default: New only)
 - **Auto Use Customizations** (Default: On)
+- **Pick Lower Level** (Default: Off)
 - **Pickup Range %** — 100% is the game's normal distance (Default: 100%, range 100–500%)
 - **Backpack HUD Summary Seconds** — 0 doesn't show it on screen at all (Default: 10, max 60)
 - **Backpack Summary In Console** (Default: On)
@@ -64,6 +65,25 @@ keeps it from re-collecting anything you deliberately dropped.
 Being *in your inventory* is the only thing that marks an item as seen — merely trying to
 pick something up does not. So an item you couldn't take because your backpack was full is
 picked up normally later, once you have room for it.
+
+### Pick Lower Level
+
+Off by default, so AutoLoot skips gear that is weaker than the best of its kind you already
+carry or have equipped. Weapons compete only within their own ammo type, so a great SMG
+never stops you picking up a pistol.
+
+With a level 2 pistol on the ground:
+
+| Best pistol you hold | Result |
+| --- | --- |
+| none | picked up |
+| level 1 | picked up |
+| level 2 | picked up |
+| level 3 or above | left behind |
+
+Anything whose level can't be read is picked up regardless, as is anything with no level at
+all — customizations are never affected by this setting. Turn it on to go back to
+collecting everything.
 
 ### Class mods and customizations
 

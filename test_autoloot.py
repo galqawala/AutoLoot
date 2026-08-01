@@ -129,10 +129,12 @@ class FakeWeaponTypeDefinition:
 
 
 class FakeDefinitionData:
-    def __init__(self, unique_id, my_class=True, ammo="Ammo_Repeater_Pistol"):
+    def __init__(self, unique_id, my_class=True, ammo="Ammo_Repeater_Pistol", level=0):
         self.UniqueId = unique_id
         self.ItemDefinition = FakeItemDefinition(my_class)
         self.WeaponTypeDefinition = FakeWeaponTypeDefinition(ammo)
+        # 0 means "no level to compare", which is how most tests want it.
+        self.GameStage = level
 
 
 CUSTOMIZATION_CLASS = "WillowUsableCustomizationItem"
@@ -147,9 +149,10 @@ class FakeInventory:
         useful=True,
         my_class=True,
         ammo="Ammo_Repeater_Pistol",
+        level=0,
     ):
         self.Class = FakeClass(class_name)
-        self.DefinitionData = FakeDefinitionData(unique_id, my_class, ammo)
+        self.DefinitionData = FakeDefinitionData(unique_id, my_class, ammo, level)
         self.Inventory = None  # next link when held in an equipped chain
         self.useful = useful
         self.dlc_met = True
@@ -196,8 +199,11 @@ class FakePickup:
         useful=True,
         my_class=True,
         ammo="Ammo_Repeater_Pistol",
+        level=0,
     ):
-        self._inventory = FakeInventory(unique_id, class_name, useful, my_class, ammo)
+        self._inventory = FakeInventory(
+            unique_id, class_name, useful, my_class, ammo, level
+        )
         self._location = Vec(distance, 0.0, 0.0)
         self.destroyed = False
 
@@ -314,6 +320,7 @@ class AutoLootTests(unittest.TestCase):
         autoloot.hud_summary_seconds.value = 0
         autoloot.summary_in_console.value = False
         autoloot.auto_use_customizations.value = False
+        autoloot.pick_lower_level.value = True  # off unless a test is about it
         autoloot.collected_last_pass = False
         sys.modules["ui_utils"].shown.clear()
         sys.modules["unrealsdk.logging"].logged.clear()
@@ -473,6 +480,79 @@ class AutoLootTests(unittest.TestCase):
         run_one_scan(pc)
         self.assertEqual(len(pc.willow_globals.PickupList), 1, "class mod should remain")
         self.assertEqual(len(pc.inv_manager.Backpack), 1)
+
+    # --- pick lower level ---
+
+    def collected(self, loot, backpack=(), equipped=()):
+        """Run one scan with the level rule active; True if the loot was taken."""
+        autoloot.pick_lower_level.value = False
+        pc = FakePlayerController([loot], backpack=list(backpack))
+        if equipped:
+            chain = None
+            for item in reversed(equipped):
+                item.Inventory = chain
+                chain = item
+            pc.inv_manager.InventoryChain = chain
+        run_one_scan(pc)
+        return pc.willow_globals.PickupList == []
+
+    def test_takes_loot_when_none_of_that_kind_is_owned(self):
+        loot = FakePickup(1, ammo="Ammo_Repeater_Pistol", level=2)
+        self.assertTrue(self.collected(loot))
+
+    def test_takes_loot_above_the_best_owned(self):
+        owned = FakeInventory(9, ammo="Ammo_Repeater_Pistol", level=1)
+        loot = FakePickup(1, ammo="Ammo_Repeater_Pistol", level=2)
+        self.assertTrue(self.collected(loot, backpack=[owned]))
+
+    def test_takes_loot_equal_to_the_best_owned(self):
+        owned = FakeInventory(9, ammo="Ammo_Repeater_Pistol", level=2)
+        loot = FakePickup(1, ammo="Ammo_Repeater_Pistol", level=2)
+        self.assertTrue(self.collected(loot, backpack=[owned]))
+
+    def test_leaves_loot_below_the_best_owned(self):
+        owned = FakeInventory(9, ammo="Ammo_Repeater_Pistol", level=3)
+        loot = FakePickup(1, ammo="Ammo_Repeater_Pistol", level=2)
+        self.assertFalse(self.collected(loot, backpack=[owned]))
+
+    def test_equipped_gear_counts_towards_the_best_owned(self):
+        """Not just the backpack - the gun in your hands is the one to beat."""
+        equipped = FakeInventory(9, ammo="Ammo_Repeater_Pistol", level=5)
+        loot = FakePickup(1, ammo="Ammo_Repeater_Pistol", level=2)
+        self.assertFalse(self.collected(loot, equipped=[equipped]))
+
+    def test_a_better_smg_does_not_block_a_pistol(self):
+        """Weapons only compete within their own ammo type."""
+        owned = FakeInventory(9, ammo="Ammo_Patrol_SMG", level=9)
+        loot = FakePickup(1, ammo="Ammo_Repeater_Pistol", level=2)
+        self.assertTrue(self.collected(loot, backpack=[owned]))
+
+    def test_gear_competes_within_its_own_category(self):
+        shield = FakeInventory(9, "WillowShield", level=5)
+        better_grenade = FakePickup(1, "WillowGrenadeMod", level=2)
+        worse_shield = FakePickup(2, "WillowShield", level=2)
+        self.assertTrue(self.collected(better_grenade, backpack=[shield]))
+        self.assertFalse(self.collected(worse_shield, backpack=[shield]))
+
+    def test_takes_loot_whose_level_cannot_be_read(self):
+        """A missing or zero GameStage means the rule simply does not apply."""
+        owned = FakeInventory(9, ammo="Ammo_Repeater_Pistol", level=50)
+        loot = FakePickup(1, ammo="Ammo_Repeater_Pistol", level=0)
+        self.assertTrue(self.collected(loot, backpack=[owned]))
+
+    def test_customizations_are_never_level_filtered(self):
+        owned = FakeInventory(9, CUSTOMIZATION_CLASS, level=50)
+        loot = customization(1, unlocked=False)
+        loot.Inventory.DefinitionData.GameStage = 2
+        self.assertTrue(self.collected(loot, backpack=[owned]))
+
+    def test_pick_lower_level_on_collects_regardless(self):
+        autoloot.pick_lower_level.value = True
+        owned = FakeInventory(9, ammo="Ammo_Repeater_Pistol", level=50)
+        loot = FakePickup(1, ammo="Ammo_Repeater_Pistol", level=2)
+        pc = FakePlayerController([loot], backpack=[owned])
+        run_one_scan(pc)
+        self.assertEqual(pc.willow_globals.PickupList, [])
 
     # --- auto use customizations ---
 

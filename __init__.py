@@ -76,6 +76,17 @@ pickup_customizations = DropdownOption(
         " unlocked, since picking those up gains you nothing."
     ),
 )
+pick_lower_level = BoolOption(
+    "Pick Lower Level",
+    False,
+    description=(
+        "Collect gear weaker than the best of its kind you already carry or have"
+        " equipped. Off by default, so a level 2 pistol is left behind once you"
+        " hold a level 3 one, but taken while your best is level 2 or lower."
+        " Weapons compare within their own ammo type. Things without a level,"
+        " such as customizations, are never affected."
+    ),
+)
 auto_use_customizations = BoolOption(
     "Auto Use Customizations",
     True,
@@ -174,6 +185,26 @@ def unique_id_of(inventory):
     return getattr(definition_data, "UniqueId", None)
 
 
+def iter_owned_inventory(caller):
+    """Every item the player holds - backpack first, then what is equipped.
+
+    One definition of "owned", so the seen list and the level comparison can
+    never disagree about whether an equipped gun counts.
+    """
+    inventory_manager = caller.GetPawnInventoryManager()
+    if inventory_manager:
+        yield from inventory_manager.Backpack
+
+    pawn = caller.Pawn
+    if pawn is None or pawn.InvManager is None:
+        return
+    for chain in (pawn.InvManager.InventoryChain, pawn.InvManager.ItemChain):
+        item = chain
+        while item is not None:
+            yield item
+            item = item.Inventory
+
+
 def update_seen_ids(caller):
     """Record everything the player is currently carrying as already seen.
 
@@ -183,25 +214,10 @@ def update_seen_ids(caller):
     "has been in my inventory" and nothing else. Anything the player drops is
     therefore still ignored, while anything we failed to collect is retried.
     """
-    inventory_manager = caller.GetPawnInventoryManager()
-    if not inventory_manager:
-        return
-
-    for item in inventory_manager.Backpack:
+    for item in iter_owned_inventory(caller):
         unique_id = unique_id_of(item)
         if unique_id is not None:
             seen_unique_ids.add(unique_id)
-
-    pawn = caller.Pawn
-    if pawn is None or pawn.InvManager is None:
-        return
-    for chain in (pawn.InvManager.InventoryChain, pawn.InvManager.ItemChain):
-        item = chain
-        while item is not None:
-            unique_id = unique_id_of(item)
-            if unique_id is not None:
-                seen_unique_ids.add(unique_id)
-            item = item.Inventory
 
 
 def use_customizations(caller):
@@ -281,6 +297,70 @@ def ammo_label(weapon) -> str:
     return prettify_ammo_name(resource.Name)
 
 
+def item_kind(item):
+    """The group an item is compared and counted within.
+
+    Weapons group by ammo type, everything else by its category. None for
+    anything the mod does not track.
+    """
+    if item is None or item.Class is None:
+        return None
+    class_name = item.Class.Name
+    if WEAPON_CLASS_TOKEN in class_name:
+        return ammo_label(item)
+    return next(
+        (label for token, label in GEAR_CATEGORIES if token in class_name),
+        None,
+    )
+
+
+def item_level(item):
+    """The item's level, or None when it has no level worth comparing.
+
+    GameStage is the level an item is generated at and what its card shows.
+    Customizations are excluded outright - they are graded by whether you have
+    unlocked them, not by level, and already have their own setting.
+    """
+    if item is None or item.Class is None:
+        return None
+    if CUSTOMIZATION_CLASS_TOKEN in item.Class.Name:
+        return None
+    definition_data = item.DefinitionData
+    if definition_data is None:
+        return None
+    stage = getattr(definition_data, "GameStage", None)
+    if stage is None or stage <= 0:
+        return None
+    return stage
+
+
+def best_owned_levels(caller):
+    """The highest level held of each kind, across backpack and equipped gear."""
+    best = {}
+    for item in iter_owned_inventory(caller):
+        level = item_level(item)
+        kind = None if level is None else item_kind(item)
+        if kind is not None and level > best.get(kind, 0):
+            best[kind] = level
+    return best
+
+
+def is_worth_taking(inventory, best_levels) -> bool:
+    """Whether this is at least as good as the best of its kind already held.
+
+    Anything without a level, or of a kind the mod does not track, is always
+    worth taking - the rule simply does not apply to it. Holding none of a kind
+    leaves the best at 0, so the first one is always collected.
+    """
+    level = item_level(inventory)
+    if level is None:
+        return True
+    kind = item_kind(inventory)
+    if kind is None:
+        return True
+    return level >= best_levels.get(kind, 0)
+
+
 def backpack_tally(caller):
     """Count the backpack, ammo types and gear categories together in one tally.
 
@@ -296,18 +376,9 @@ def backpack_tally(caller):
 
     counts = {}
     for item in inventory_manager.Backpack:
-        if item is None or item.Class is None:
+        label = item_kind(item)
+        if label is None:
             continue
-        class_name = item.Class.Name
-        if WEAPON_CLASS_TOKEN in class_name:
-            label = ammo_label(item)
-        else:
-            label = next(
-                (label for token, label in GEAR_CATEGORIES if token in class_name),
-                None,
-            )
-            if label is None:
-                continue
         counts[label] = counts.get(label, 0) + 1
 
     return (
@@ -375,6 +446,9 @@ def player_tick(obj, _args, _ret, _func):
     )
     view_location = obj.CalcViewActorLocation
     collected_any = False
+    # Once per pass rather than per pickup: the answer cannot change until we
+    # actually collect something, and it walks the whole inventory.
+    best_levels = {} if pick_lower_level.value else best_owned_levels(obj)
 
     # Snapshot the array before touching it. A successful pickup destroys the
     # WillowPickup, and WillowPickup.Destroyed() calls WillowGlobals.RemovePickup,
@@ -392,6 +466,8 @@ def player_tick(obj, _args, _ret, _func):
                 continue
             # Last, because deciding about a customization calls into the game.
             if not should_pickup(inventory, obj):
+                continue
+            if not is_worth_taking(inventory, best_levels):
                 continue
 
             # A collected pickup is destroyed inside this call, and Destroyed()
@@ -460,6 +536,7 @@ MOD_OPTIONS = [
     pickup_class_mods,
     pickup_customizations,
     auto_use_customizations,
+    pick_lower_level,
     range_percent,
     hud_summary_seconds,
     summary_in_console,
