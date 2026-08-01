@@ -31,6 +31,7 @@ middle choice instead:
 - **Pickup Customizations** — *All*, *New only*, or *None* (Default: New only)
 - **Auto Use Customizations** (Default: On)
 - **Pick Lower Level** (Default: Off)
+- **Drop Lowest Level When Full** (Default: On)
 - **Pickup Range %** — 100% is the game's normal distance (Default: 100%, range 100–500%)
 - **Backpack HUD Summary Seconds** — 0 doesn't show it on screen at all (Default: 10, max 60)
 - **Backpack Summary In Console** (Default: On)
@@ -84,6 +85,30 @@ With a level 2 pistol on the ground:
 Anything whose level can't be read is picked up regardless, as is anything with no level at
 all — customizations are never affected by this setting. Turn it on to go back to
 collecting everything.
+
+### Drop Lowest Level When Full
+
+On by default. When your backpack is full and there's loot worth taking, AutoLoot makes room
+by throwing out the worst item of whatever kind is filling the bag most — so the category
+you're hoarding gives up a slot rather than the one thing you own of something.
+
+Say the bag is full and a pistol is on the ground:
+
+| Kind | What you're carrying | |
+| --- | --- | --- |
+| SMG | level 40 (9$), level 12 (50$), level 12 (7$) | most of these |
+| Pistol | level 30 (80$) | |
+| Shields | level 22 (60$) | |
+
+SMGs are the fullest kind, the two level 12s are the lowest, and the cheaper one loses the
+tie — so the **level 12 SMG worth 7$** is dropped and the pistol collected.
+
+Only the backpack is touched: equipped gear is never dropped, and neither is anything you've
+marked as a **favourite**. If everything is a favourite, nothing is dropped and the loot is
+simply left. A slot is only given up once AutoLoot has decided it actually wants the loot.
+
+Dropped items land on the ground and are never re-collected, since they've been in your
+inventory.
 
 ### Class mods and customizations
 

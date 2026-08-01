@@ -140,6 +140,11 @@ class FakeDefinitionData:
 CUSTOMIZATION_CLASS = "WillowUsableCustomizationItem"
 CLASS_MOD_CLASS = "WillowClassMod"
 
+# WillowInventory.PlayerMark, as the game's own toggle uses them.
+MARK_TRASH = 0
+MARK_STANDARD = 1
+MARK_FAVORITE = 2
+
 
 class FakeInventory:
     def __init__(
@@ -150,6 +155,8 @@ class FakeInventory:
         my_class=True,
         ammo="Ammo_Repeater_Pistol",
         level=0,
+        price=0,
+        mark=MARK_STANDARD,
     ):
         self.Class = FakeClass(class_name)
         self.DefinitionData = FakeDefinitionData(unique_id, my_class, ammo, level)
@@ -158,6 +165,14 @@ class FakeInventory:
         self.dlc_met = True
         self.consumed = False
         self.backpack = None  # set once it is sitting in someone's backpack
+        self.price = price
+        self.mark = mark
+
+    def GetMonetaryValue(self):
+        return self.price
+
+    def GetMark(self):
+        return self.mark
 
     def IsUsefulToThisPlayer(self, _pc):
         # False for an already-unlocked customization, as the game reports it.
@@ -267,6 +282,9 @@ class FakeInventoryManager:
     def GetUnreadiedInventoryMaxSize(self):
         return self.capacity
 
+    def GetEmptyBackpackSlots(self):
+        return max(0, self.capacity - len(self.Backpack))
+
 
 class FakePawn:
     def __init__(self, inv_manager):
@@ -284,6 +302,7 @@ class FakePlayerController:
         self.willow_globals = FakeWillowGlobals(pickups)
         self.CalcViewActorLocation = Vec(0.0, 0.0, 0.0)
         self.attempts = 0
+        self.thrown = []
 
     def GetPawnInventoryManager(self):
         return self.inv_manager
@@ -301,6 +320,18 @@ class FakePlayerController:
         pickup.Inventory = None  # DroppedPickup.GiveTo clears it, then...
         self.willow_globals.PickupList.remove(pickup)  # Destroyed -> RemovePickup
         pickup.destroyed = True  # ...the actor itself is gone
+
+    def CanDrop(self, _item):
+        return True
+
+    def ThrowInventory(self, item, _quantity=1):
+        # ServerThrowInventory: out of the backpack, onto the ground as a pickup.
+        self.inv_manager.Backpack.remove(item)
+        self.thrown.append(item)
+        dropped = FakePickup(item.DefinitionData.UniqueId, item.Class.Name)
+        dropped.Inventory = item
+        self.willow_globals.PickupList.append(dropped)
+        return dropped
 
 
 def run_one_scan(pc):
@@ -321,6 +352,7 @@ class AutoLootTests(unittest.TestCase):
         autoloot.summary_in_console.value = False
         autoloot.auto_use_customizations.value = False
         autoloot.pick_lower_level.value = True  # off unless a test is about it
+        autoloot.drop_lowest_when_full.value = False
         autoloot.collected_last_pass = False
         sys.modules["ui_utils"].shown.clear()
         sys.modules["unrealsdk.logging"].logged.clear()
@@ -480,6 +512,129 @@ class AutoLootTests(unittest.TestCase):
         run_one_scan(pc)
         self.assertEqual(len(pc.willow_globals.PickupList), 1, "class mod should remain")
         self.assertEqual(len(pc.inv_manager.Backpack), 1)
+
+    # --- drop lowest level when full ---
+
+    def full_backpack_run(self, backpack, loot=None):
+        """One scan with a backpack exactly at capacity and one thing worth taking."""
+        autoloot.drop_lowest_when_full.value = True
+        loot = loot or FakePickup(99, ammo="Ammo_Repeater_Pistol", level=5)
+        pc = FakePlayerController(
+            [loot], capacity=len(backpack), backpack=list(backpack)
+        )
+        run_one_scan(pc)
+        return pc
+
+    def test_drops_from_the_kind_taking_the_most_space(self):
+        smgs = [FakeInventory(i, ammo="Ammo_Patrol_SMG", level=40) for i in range(3)]
+        shield = FakeInventory(8, "WillowShield", level=1)  # lower level, but rarer
+        pc = self.full_backpack_run([*smgs, shield])
+
+        self.assertEqual(len(pc.thrown), 1)
+        self.assertIn(pc.thrown[0], smgs, "should give up an SMG, not the lone shield")
+
+    def test_drops_the_lowest_level_of_that_kind(self):
+        smgs = [
+            FakeInventory(1, ammo="Ammo_Patrol_SMG", level=40),
+            FakeInventory(2, ammo="Ammo_Patrol_SMG", level=12),
+            FakeInventory(3, ammo="Ammo_Patrol_SMG", level=30),
+        ]
+        pc = self.full_backpack_run(smgs)
+        self.assertEqual(pc.thrown, [smgs[1]])
+
+    def test_price_breaks_a_tie_on_level(self):
+        smgs = [
+            FakeInventory(1, ammo="Ammo_Patrol_SMG", level=12, price=50),
+            FakeInventory(2, ammo="Ammo_Patrol_SMG", level=12, price=7),
+            FakeInventory(3, ammo="Ammo_Patrol_SMG", level=40, price=1),
+        ]
+        pc = self.full_backpack_run(smgs)
+        self.assertEqual(pc.thrown, [smgs[1]], "cheapest of the two level 12s")
+
+    def test_favourite_mark_value_matches_both_games(self):
+        """PlayerMark values are identical in BL2 and TPS - verified, not assumed.
+
+        Each game's InventoryListPanelGFxObject.CycleSelectedThingAsTrashOrFavorite
+        sets a value and then displays the matching icon:
+
+            BL2   mark 1 -> SetMark(0) shows TF_Trash      so 0 = Trash
+                  mark 0 -> SetMark(2) shows TF_Favorite   so 2 = Favorite
+                  mark 2 -> SetMark(1) shows TF_Standard   so 1 = Standard
+
+            TPS   mark 1 -> SetMark(2) shows TF_Favorite   so 2 = Favorite
+                  mark 2 -> SetMark(1) shows TF_Standard   so 1 = Standard
+                  (no trash branch - TPS exposes favourites only)
+
+        TPS never marks anything as trash through its UI, but the numbering is
+        the same, so one constant is correct for both.
+        """
+        self.assertEqual(autoloot.MARK_FAVORITE, MARK_FAVORITE)
+        self.assertEqual(autoloot.MARK_FAVORITE, 2)
+
+    def test_trash_marked_items_are_droppable(self):
+        """BL2 only. Trash is not protected - it is the stuff you want gone."""
+        smgs = [
+            FakeInventory(1, ammo="Ammo_Patrol_SMG", level=40, mark=MARK_TRASH),
+            FakeInventory(2, ammo="Ammo_Patrol_SMG", level=50, mark=MARK_STANDARD),
+            FakeInventory(3, ammo="Ammo_Patrol_SMG", level=60, mark=MARK_STANDARD),
+        ]
+        pc = self.full_backpack_run(smgs)
+        self.assertEqual(pc.thrown, [smgs[0]], "lowest level, and trash is fair game")
+
+    def test_never_drops_a_favourite(self):
+        smgs = [
+            FakeInventory(1, ammo="Ammo_Patrol_SMG", level=1, mark=MARK_FAVORITE),
+            FakeInventory(2, ammo="Ammo_Patrol_SMG", level=40),
+            FakeInventory(3, ammo="Ammo_Patrol_SMG", level=30),
+        ]
+        pc = self.full_backpack_run(smgs)
+        self.assertEqual(pc.thrown, [smgs[2]], "lowest level that is not a favourite")
+
+    def test_the_freed_slot_is_used_for_the_loot(self):
+        smgs = [FakeInventory(i, ammo="Ammo_Patrol_SMG", level=40) for i in range(3)]
+        loot = FakePickup(99, ammo="Ammo_Repeater_Pistol", level=5)
+        wanted = loot.Inventory  # read now; collecting destroys the pickup
+        pc = self.full_backpack_run(smgs, loot=loot)
+
+        self.assertNotIn(loot, pc.willow_globals.PickupList, "loot was not collected")
+        self.assertIn(wanted, pc.inv_manager.Backpack)
+        # The thrown SMG is on the ground now, so the world is not empty.
+        self.assertEqual(len(pc.willow_globals.PickupList), 1)
+        self.assertEqual(len(pc.inv_manager.Backpack), 3, "still exactly full")
+
+    def test_drops_nothing_when_the_backpack_has_room(self):
+        smgs = [FakeInventory(i, ammo="Ammo_Patrol_SMG", level=40) for i in range(3)]
+        autoloot.drop_lowest_when_full.value = True
+        loot = FakePickup(99, ammo="Ammo_Repeater_Pistol", level=5)
+        pc = FakePlayerController([loot], capacity=39, backpack=list(smgs))
+        run_one_scan(pc)
+        self.assertEqual(pc.thrown, [])
+
+    def test_option_off_drops_nothing_even_when_full(self):
+        smgs = [FakeInventory(i, ammo="Ammo_Patrol_SMG", level=40) for i in range(3)]
+        autoloot.drop_lowest_when_full.value = False
+        loot = FakePickup(99, ammo="Ammo_Repeater_Pistol", level=5)
+        pc = FakePlayerController([loot], capacity=3, backpack=list(smgs))
+        run_one_scan(pc)
+        self.assertEqual(pc.thrown, [])
+        self.assertEqual(len(pc.willow_globals.PickupList), 1, "loot stays on ground")
+
+    def test_drops_nothing_when_everything_is_a_favourite(self):
+        smgs = [
+            FakeInventory(i, ammo="Ammo_Patrol_SMG", level=40, mark=MARK_FAVORITE)
+            for i in range(3)
+        ]
+        pc = self.full_backpack_run(smgs)
+        self.assertEqual(pc.thrown, [])
+        self.assertEqual(len(pc.inv_manager.Backpack), 3)
+
+    def test_a_dropped_item_is_not_picked_straight_back_up(self):
+        smgs = [FakeInventory(i, ammo="Ammo_Patrol_SMG", level=40) for i in range(3)]
+        pc = self.full_backpack_run(smgs)
+        thrown = pc.thrown[0]
+        run_one_scan(pc)
+        run_one_scan(pc)
+        self.assertNotIn(thrown, pc.inv_manager.Backpack)
 
     # --- pick lower level ---
 

@@ -76,6 +76,16 @@ pickup_customizations = DropdownOption(
         " unlocked, since picking those up gains you nothing."
     ),
 )
+drop_lowest_when_full = BoolOption(
+    "Drop Lowest Level When Full",
+    True,
+    description=(
+        "When your backpack is full and there is loot worth taking, throw out"
+        " the worst of whatever kind is filling it most - the lowest level of"
+        " those, cheapest first if they tie. Anything you have marked as a"
+        " favourite is never thrown out."
+    ),
+)
 pick_lower_level = BoolOption(
     "Pick Lower Level",
     False,
@@ -361,6 +371,75 @@ def is_worth_taking(inventory, best_levels) -> bool:
     return level >= best_levels.get(kind, 0)
 
 
+# WillowInventory.PlayerMark. Derived from the game's own toggle, which sets 2
+# and then shows TF_Favorite, and sets 1 and then shows TF_Standard.
+MARK_FAVORITE = 2
+
+
+def item_price(item) -> int:
+    """What a vendor would pay, used only to break a tie between equal levels."""
+    try:
+        return int(item.GetMonetaryValue())
+    except Exception:  # noqa: BLE001
+        return 0
+
+
+def is_favorite(item) -> bool:
+    try:
+        return int(item.GetMark()) == MARK_FAVORITE
+    except Exception:  # noqa: BLE001
+        # If the mark cannot be read, treat it as precious rather than risk
+        # throwing away something the player deliberately kept.
+        return True
+
+
+def backpack_is_full(caller) -> bool:
+    inventory_manager = caller.GetPawnInventoryManager()
+    return (
+        inventory_manager is not None and inventory_manager.GetEmptyBackpackSlots() <= 0
+    )
+
+
+def free_a_backpack_slot(caller) -> bool:
+    """Throw out the worst item of whatever kind is filling the backpack most.
+
+    Returns whether a slot was actually freed. Only the backpack is considered,
+    never equipped gear, and never anything marked as a favourite.
+    """
+    inventory_manager = caller.GetPawnInventoryManager()
+    if inventory_manager is None:
+        return False
+
+    by_kind = {}
+    for item in inventory_manager.Backpack:
+        kind = item_kind(item)
+        if kind is None or is_favorite(item) or not caller.CanDrop(item):
+            continue
+        by_kind.setdefault(kind, []).append(item)
+
+    if not by_kind:
+        return False
+
+    # Most numerous kind, then within it the lowest level, cheapest, oldest.
+    # Every tie is broken by something stable so the same backpack always gives
+    # up the same item rather than whichever happened to be looked at first.
+    fullest = min(by_kind, key=lambda kind: (-len(by_kind[kind]), kind))
+    worst = min(
+        by_kind[fullest],
+        key=lambda item: (
+            item_level(item) or 0,
+            item_price(item),
+            unique_id_of(item) or 0,
+        ),
+    )
+
+    # Judge success by the backpack shrinking rather than by inspecting the item
+    # afterwards - it has been handed to the engine by then.
+    count_before = len(inventory_manager.Backpack)
+    caller.ThrowInventory(worst, 1)
+    return len(inventory_manager.Backpack) < count_before
+
+
 def backpack_tally(caller):
     """Count the backpack, ammo types and gear categories together in one tally.
 
@@ -469,6 +548,10 @@ def player_tick(obj, _args, _ret, _func):
                 continue
             if not is_worth_taking(inventory, best_levels):
                 continue
+            # Only once we have decided we want this one, so a slot is never
+            # given up for loot we were going to walk past anyway.
+            if drop_lowest_when_full.value and backpack_is_full(obj):
+                free_a_backpack_slot(obj)
 
             # A collected pickup is destroyed inside this call, and Destroyed()
             # takes it out of PickupList. Read success off the list's length
@@ -537,6 +620,7 @@ MOD_OPTIONS = [
     pickup_customizations,
     auto_use_customizations,
     pick_lower_level,
+    drop_lowest_when_full,
     range_percent,
     hud_summary_seconds,
     summary_in_console,
