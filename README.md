@@ -12,6 +12,26 @@ dropped.
 - **Adjustable Range**: Picks up within a configurable percentage of your normal interaction distance, up to 5x
 - **Clears a whole pile at once**: Everything in range is collected in a single pass, and another pass runs immediately afterwards while there is still loot to take
 
+## Verifying it
+
+`verify_autoloot.py` checks the mod against the running game rather than against a mock of
+it. Put it in your `sdk_mods` folder, then from the SDK console (tilde), while stood in a
+level:
+
+```
+pyexec verify_autoloot.py
+```
+
+It prints what every decision function returns for your actual character — how many backpack
+weapons report having ammo, which item would be dropped to make room, which slots are free,
+and so on — plus a handful of pure-logic checks. **It changes nothing:** it calls only
+functions that read state, never picks up, drops, equips or consumes anything, and does not
+save. The functions that do change things are checked for existence only.
+
+There is deliberately no mock-based test suite. One existed and was deleted: it stood in for
+the engine, so it only ever confirmed what the mod's author already believed, and it passed
+cleanly through three separate shipped bugs.
+
 ## Installation
 
 1. Place the `AutoLoot` folder in your `sdk_mods` directory
@@ -32,6 +52,9 @@ middle choice instead:
 - **Auto Use Customizations** (Default: On)
 - **Pick Lower Level** (Default: Off)
 - **Drop Lowest Level When Full** (Default: On)
+- **Fill Empty Equipment Slots** (Default: On)
+- **Switch Weapon When Out Of Ammo** (Default: On)
+- **Equip From Backpack When All Empty** (Default: On)
 - **Pickup Range %** — 100% is the game's normal distance (Default: 100%, range 100–500%)
 - **Backpack HUD Summary Seconds** — 0 doesn't show it on screen at all (Default: 10, max 60)
 - **Backpack Summary In Console** (Default: On)
@@ -85,6 +108,45 @@ With a level 2 pistol on the ground:
 Anything whose level can't be read is picked up regardless, as is anything with no level at
 all — customizations are never affected by this setting. Turn it on to go back to
 collecting everything.
+
+### Filling empty slots
+
+**Fill Empty Equipment Slots** equips something from your backpack into any slot standing
+empty — a weapon slot, or your shield, grenade mod, class mod or artifact. Slots that
+already hold something are never touched, and only weapons that have ammo are used.
+
+Whether a slot is available at all is the game's own answer
+(`InventoryShouldBeReadiedWhenEquipped`), so weapon slots you haven't unlocked yet are
+skipped, class mods your character can't use are skipped, and nothing is equipped while
+you're riding a vehicle.
+
+### Running dry
+
+When the gun in your hands runs out of ammo, **Switch Weapon When Out Of Ammo** moves you to
+the next slot holding one that still has some, wrapping round from slot 4 back to slot 1.
+Holding slot 3 with both 3 and 4 empty puts you on slot 1; if slot 4 had ammo you'd get slot
+4 instead. Slots you haven't unlocked yet are simply skipped, so this works the same with
+one slot or four.
+
+If *every* equipped weapon is dry, **Equip From Backpack When All Empty** pulls a loaded
+weapon out of your backpack into the slot you're holding. If there's nothing loaded
+anywhere, nothing happens and you keep what you have.
+
+"Out of ammo" is the game's own `HasAnyAmmo` test, so it counts the clip as well as the
+reserve, and it won't switch away from a TPS laser that only overheats.
+
+Pulling a backpack weapon straight into your active slot turned out to be unreliable — the
+game's own removal path for the weapon in your hands takes a rougher route than a normal
+weapon switch, and no amount of waiting for the right moment (fire released, no transition in
+flight) made it safe; it could still leave the new weapon unable to fire, zoom, or even show
+a crosshair, with no error anywhere. So AutoLoot never touches your active slot directly for
+this any more. Instead it bounces through another equipped slot first — the same plain weapon
+switch **Switch Weapon When Out Of Ammo** already uses safely — loads the backpack weapon into
+your *previous* slot while you're standing on the other one, then switches back. Three quick,
+ordinary weapon switches instead of one risky backpack operation on the gun in your hands —
+you'll briefly see the other weapon in your hands while this happens. If only one weapon slot
+is unlocked there's nothing to bounce through, so that one case still equips directly as
+before.
 
 ### Drop Lowest Level When Full
 
