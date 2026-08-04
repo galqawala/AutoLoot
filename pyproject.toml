@@ -1,6 +1,6 @@
 [project]
 name = "auto_loot"
-version = "2.0.36"
+version = "2.0.38"
 authors = [{ name = "galqawala" }]
 description = """\
 Automatically picks up weapons and items with configurable options
@@ -9,7 +9,7 @@ dependencies = ["ui_utils"]
 
 [tool.sdkmod]
 name = "AutoLoot"
-version = "2.0.36"
+version = "2.0.38"
 supported_games = ["BL2", "TPS"]
 license = {name = "GPL3", url = "https://choosealicense.com/licenses/gpl-3.0/" }
 download = "https://github.com/galqawala/AutoLoot/raw/refs/heads/master/AutoLoot.sdkmod"

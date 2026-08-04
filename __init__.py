@@ -117,9 +117,9 @@ pick_lower_level = BoolOption(
     "Pick Lower Level",
     False,
     description=(
-        "Collect gear weaker than the best of its kind you already carry or have"
-        " equipped. Off by default, so a level 2 pistol is left behind once you"
-        " hold a level 3 one, but taken while your best is level 2 or lower."
+        "Collect gear weaker than the worst of its kind you already carry or have"
+        " equipped. Off by default, so a level 2 pistol is left behind once your"
+        " weakest is level 3, but taken while your weakest is level 2 or lower."
         " Weapons compare within their own ammo type. Things without a level,"
         " such as customizations, are never affected."
     ),
@@ -880,8 +880,8 @@ def character_level(caller):
     return level if level > 0 else None
 
 
-def best_owned_levels(caller):
-    """The highest level held of each kind, across backpack and equipped gear.
+def worst_owned_levels(caller):
+    """The lowest level held of each kind, across backpack and equipped gear.
 
     Each is capped at the character's own level. Gear above your level is not
     something you can use yet, so letting one lucky over-level drop set the bar
@@ -889,7 +889,7 @@ def best_owned_levels(caller):
     precisely what happened.
     """
     cap = character_level(caller)
-    best = {}
+    worst = {}
     for item in iter_owned_inventory(caller):
         level = item_level(item)
         if level is None:
@@ -899,17 +899,17 @@ def best_owned_levels(caller):
             continue
         if cap is not None:
             level = min(level, cap)
-        if level > best.get(kind, 0):
-            best[kind] = level
-    return best
+        if kind not in worst or level < worst[kind]:
+            worst[kind] = level
+    return worst
 
 
-def is_worth_taking(inventory, best_levels) -> bool:
-    """Whether this is at least as good as the best of its kind already held.
+def is_worth_taking(inventory, worst_levels) -> bool:
+    """Whether this is at least as good as the worst of its kind already held.
 
     Anything without a level, or of a kind the mod does not track, is always
     worth taking - the rule simply does not apply to it. Holding none of a kind
-    leaves the best at 0, so the first one is always collected.
+    leaves nothing in worst_levels, so the first one is always collected.
     """
     level = item_level(inventory)
     if level is None:
@@ -917,7 +917,7 @@ def is_worth_taking(inventory, best_levels) -> bool:
     kind = item_kind(inventory)
     if kind is None:
         return True
-    return level >= best_levels.get(kind, 0)
+    return level >= worst_levels.get(kind, level)
 
 
 # WillowInventory.PlayerMark. Derived from the game's own toggle, which sets 2
@@ -1014,41 +1014,61 @@ def backpack_tally(caller):
 
     One tally rather than two, because the summary lists them as a single run:
     keeping them apart would only let the two halves be ordered by different
-    rules. Returns `(counts, used, capacity)`, or None if there is no inventory
-    to read. `used` and `capacity` are the game's own two numbers rather than
-    anything derived here.
+    rules. Returns `(counts, levels, used, capacity)`, or None if there is no
+    inventory to read. `used` and `capacity` are the game's own two numbers
+    rather than anything derived here. `levels` holds each kind's `(min, max)`
+    item level seen, skipping items with no level to compare.
     """
     inventory_manager = caller.GetPawnInventoryManager()
     if inventory_manager is None:
         return None
 
     counts = {}
+    levels = {}
     for item in inventory_manager.Backpack:
         label = item_kind(item)
         if label is None:
             continue
         counts[label] = counts.get(label, 0) + 1
+        level = item_level(item)
+        if level is None:
+            continue
+        low, high = levels.get(label, (level, level))
+        levels[label] = (min(low, level), max(high, level))
 
     return (
         counts,
+        levels,
         inventory_manager.CountUnreadiedInventory(),
         inventory_manager.GetUnreadiedInventoryMaxSize(),
     )
 
 
-def summary_line(counts) -> str:
-    """One line of `Label N`, most first, empty categories left out.
+def summary_line(counts, levels) -> str:
+    """One line of `N Label (lvl X-Y)`, most first, empty categories left out.
 
-    Ties break on the label so the same backpack always reads the same way -
-    otherwise the order would depend on where things happen to sit in the bag.
+    Ties break randomly rather than on the label, so no one category is always
+    stuck last in a tied group - the count is what the player asked to sort by,
+    and everything below that is genuinely arbitrary.
     """
-    ordered = sorted(counts.items(), key=lambda pair: (-pair[1], pair[0]))
-    return SUMMARY_SEPARATOR.join(f"{label} {count}" for label, count in ordered if count)
+    ordered = sorted(counts.items(), key=lambda pair: (-pair[1], random.random()))
+    parts = []
+    for label, count in ordered:
+        if not count:
+            continue
+        level_range = levels.get(label)
+        if level_range is None:
+            parts.append(f"{count} {label}")
+            continue
+        low, high = level_range
+        span = f"lvl {low}" if low == high else f"lvl {low}-{high}"
+        parts.append(f"{count} {label} ({span})")
+    return SUMMARY_SEPARATOR.join(parts)
 
 
-def format_tally(counts, used, capacity):
+def format_tally(counts, levels, used, capacity):
     """A title plus one line holding everything, biggest group first."""
-    return f"Backpack  {used}/{capacity}", summary_line(counts)
+    return f"Backpack  {used}/{capacity}", summary_line(counts, levels)
 
 
 def report_backpack(caller):
@@ -1107,7 +1127,7 @@ def player_tick(obj, _args, _ret, _func):
     collected_any = False
     # Once per pass rather than per pickup: the answer cannot change until we
     # actually collect something, and it walks the whole inventory.
-    best_levels = {} if pick_lower_level.value else best_owned_levels(obj)
+    worst_levels = {} if pick_lower_level.value else worst_owned_levels(obj)
 
     # Snapshot the array before touching it. A successful pickup destroys the
     # WillowPickup, and WillowPickup.Destroyed() calls WillowGlobals.RemovePickup,
@@ -1126,7 +1146,7 @@ def player_tick(obj, _args, _ret, _func):
             # Last, because deciding about a customization calls into the game.
             if not should_pickup(inventory, obj):
                 continue
-            if not is_worth_taking(inventory, best_levels):
+            if not is_worth_taking(inventory, worst_levels):
                 continue
             # Only once we have decided we want this one, so a slot is never
             # given up for loot we were going to walk past anyway.

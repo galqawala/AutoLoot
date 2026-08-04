@@ -100,17 +100,20 @@ def main():
     )
     check(
         "summary_line orders by amount, drops zeroes",
-        autoloot.summary_line({"Pistol": 4, "Laser": 9, "SMG": 1, "Sniper": 0}),
-        "Laser 9 | Pistol 4 | SMG 1",
+        autoloot.summary_line(
+            {"Pistol": 4, "Laser": 9, "SMG": 1, "Sniper": 0},
+            {"Pistol": (14, 36), "Laser": (13, 16), "SMG": (5, 5)},
+        ),
+        "9 Laser (lvl 13-16) | 4 Pistol (lvl 14-36) | 1 SMG (lvl 5)",
     )
     check(
-        "summary_line breaks ties by name",
-        autoloot.summary_line({"Shotgun": 2, "Pistol": 2, "Laser": 2}),
-        "Laser 2 | Pistol 2 | Shotgun 2",
+        "summary_line ties on amount but keeps every entry",
+        sorted(autoloot.summary_line({"Shotgun": 2, "Pistol": 2, "Laser": 2}, {}).split(" | ")),
+        ["2 Laser", "2 Pistol", "2 Shotgun"],
     )
     check(
         "summary title shows used of capacity",
-        autoloot.format_tally({"Pistol": 2}, 3, 39)[0],
+        autoloot.format_tally({"Pistol": 2}, {"Pistol": (10, 10)}, 3, 39)[0],
         "Backpack  3/39",
     )
     check(
@@ -234,7 +237,7 @@ def main():
     attempt("CanDrop() allows", lambda: sum(1 for i in backpack if pc.CanDrop(i)))
 
     section("what the mod would decide right now")
-    attempt("best_owned_levels(pc)", lambda: autoloot.best_owned_levels(pc))
+    attempt("worst_owned_levels(pc)", lambda: autoloot.worst_owned_levels(pc))
     attempt(
         "choose_item_to_drop(pc)  [not dropped]",
         lambda: name_of(autoloot.choose_item_to_drop(pc)),
