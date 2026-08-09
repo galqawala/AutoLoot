@@ -95,11 +95,12 @@ switch_when_empty = BoolOption(
     ),
 )
 drop_lowest_when_full = BoolOption(
-    "Drop Lowest Level When Full",
+    "Drop Worst Item When Full",
     True,
     description=(
-        "When full, drop the lowest-level item of whatever kind fills your"
-        " backpack most to make room. Never a downgrade, and never a favourite."
+        "When full, drop whatever is worth least: an item over your level"
+        " first (you cannot use it yet), else the weakest one. Never a"
+        " favourite."
     ),
 )
 auto_use_customizations = BoolOption(
@@ -773,6 +774,34 @@ def backpack_is_full(caller) -> bool:
     )
 
 
+def usability_rank(item, cap):
+    """How little this item is worth keeping right now: smaller sorts first.
+
+    Above your own level (`cap`), an item is dead weight - you cannot equip
+    it until you level up to it, so it is worth nothing right now no matter
+    how high its number looks. Every over-level item ranks below every
+    usable one, and among over-level items the ONE FURTHEST above your level
+    ranks lowest, since it is the one you are furthest from ever being able
+    to use - keeping the ones closer to your level instead means the item
+    nearest to becoming useful is the one lost. Only once nothing is
+    over-level does level ordering flip back to the old rule: the weakest
+    USABLE item ranks lowest.
+
+        character level 28, backpack: 29, 29, 31, 24
+        over-level group (ranks lowest, worth least): 31, then the 29s
+        at-or-under group (only ranks lowest once the above is empty): 24
+
+    Shared by choose_item_to_drop, deciding what to sacrifice, and the
+    never-trade-down check in player_tick, deciding whether a pickup is
+    actually better than what it would cost - the same ranking must answer
+    both, or an over-level item could rank "worse" for one purpose and
+    "better" for the other.
+    """
+    level = item_level(item) or 0
+    over_level = cap is not None and level > cap
+    return (0, -level) if over_level else (1, level)
+
+
 def choose_item_to_drop(caller):
     """The item that would be thrown out to make room, or None.
 
@@ -793,17 +822,14 @@ def choose_item_to_drop(caller):
     if not by_kind:
         return None
 
-    # Most numerous kind, then within it the lowest level, cheapest, oldest.
+    # Most numerous kind, then within it the item worth least right now.
     # Every tie is broken by something stable so the same backpack always gives
     # up the same item rather than whichever happened to be looked at first.
     fullest = min(by_kind, key=lambda kind: (-len(by_kind[kind]), kind))
+    cap = character_level(caller)
     return min(
         by_kind[fullest],
-        key=lambda item: (
-            item_level(item) or 0,
-            item_price(item),
-            unique_id_of(item) or 0,
-        ),
+        key=lambda item: (usability_rank(item, cap), item_price(item), unique_id_of(item) or 0),
     )
 
 
@@ -989,6 +1015,9 @@ def player_tick(obj, _args, _ret, _func):
         / 100
     )
     view_location = obj.CalcViewActorLocation
+    # Read once per pass: it cannot change mid-pass, and choose_item_to_drop
+    # and the never-trade-down check below must agree on the same value.
+    cap = character_level(obj)
 
     # Re-uses hud_summary_seconds as its own re-trigger interval - once a
     # shown summary would have faded, standing near loot shows it again,
@@ -1045,16 +1074,14 @@ def player_tick(obj, _args, _ret, _func):
                         " manually"
                     )
                 else:
-                    new_level = item_level(inventory)
-                    worst_level = item_level(worst)
-                    if (
-                        new_level is not None
-                        and worst_level is not None
-                        and new_level < worst_level
-                    ):
+                    if usability_rank(inventory, cap) < usability_rank(worst, cap):
                         # Never trade down: dropping worst to make room for
-                        # something even weaker than worst would be a pure
-                        # loss. Leave this one on the ground.
+                        # something ranked even lower would be a pure loss -
+                        # same ranking choose_item_to_drop used to pick worst
+                        # in the first place, so an over-level worst never
+                        # looks "better" here than an on-level pickup just
+                        # because its raw number happens to be lower. Leave
+                        # this one on the ground.
                         continue
                     # Dropping something does not make room in time for THIS
                     # SAME pickup attempt - confirmed in play, a slot that
