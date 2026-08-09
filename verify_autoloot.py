@@ -166,14 +166,6 @@ def main():
             f"next_loaded_slot(from {held_slot})",
             lambda: autoloot.next_loaded_slot(held_slot, equipped),
         )
-        attempt(
-            f"next_occupied_slot(from {held_slot})  [bounce-through target]",
-            lambda: autoloot.next_occupied_slot(held_slot, equipped),
-        )
-    show(
-        "pending backpack re-equip",
-        autoloot._reequip if autoloot._reequip["stage"] else "none in progress",
-    )
     held = pc.Pawn.Weapon if pc.Pawn is not None else None
     show("weapon in hand", name_of(held))
     if held is not None:
@@ -237,7 +229,6 @@ def main():
     attempt("CanDrop() allows", lambda: sum(1 for i in backpack if pc.CanDrop(i)))
 
     section("what the mod would decide right now")
-    attempt("worst_owned_levels(pc)", lambda: autoloot.worst_owned_levels(pc))
     attempt(
         "choose_item_to_drop(pc)  [not dropped]",
         lambda: name_of(autoloot.choose_item_to_drop(pc)),

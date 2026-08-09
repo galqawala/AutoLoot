@@ -21,6 +21,8 @@ ticks_until_scan = 0
 seen_unique_ids = set()
 picking_up = False
 collected_last_pass = False
+next_near_loot_report = 0.0
+last_shown_body = None
 
 pickup_weapons = BoolOption("Pickup Weapons", True)
 pickup_shields = BoolOption("Pickup Shields", True)
@@ -51,15 +53,14 @@ CUSTOMIZATION_CLASS_TOKEN = "UsableCustomization"
 # are independent of each other, so either, both or neither can be on.
 hud_summary_seconds = SliderOption(
     "Backpack HUD Summary Seconds",
-    10,
+    19,
     0,
     60,
     1,
     True,
     description=(
-        "After clearing a pile of loot, show what your backpack now holds on"
-        " screen, for this many seconds. Set to 0 to not show it on screen at"
-        " all. Shown once the pile is cleared, not once per item."
+        "Show what your backpack now holds on screen after clearing a pile of"
+        " loot, for this many seconds. 0 disables the on-screen summary."
     ),
 )
 summary_in_console = BoolOption(
@@ -77,51 +78,28 @@ pickup_customizations = DropdownOption(
         " unlocked, since picking those up gains you nothing."
     ),
 )
-fill_empty_slots = BoolOption(
-    "Fill Empty Equipment Slots",
+auto_equip = BoolOption(
+    "Auto Equip",
     True,
     description=(
-        "Equip something from your backpack into any equipment slot standing"
-        " empty - a weapon slot, shield, grenade mod, class mod or artifact."
-        " Only weapons that have ammo are used. Full slots are left alone."
+        "Fill empty gear slots from your backpack, and swap a dry weapon for a"
+        " loaded one in any slot but the one you're holding."
     ),
 )
 switch_when_empty = BoolOption(
     "Switch Weapon When Out Of Ammo",
     True,
     description=(
-        "When the gun in your hands runs dry, switch to the next slot holding"
-        " one that still has ammo, wrapping round from slot 4 back to slot 1."
-        " Nothing happens if none of your equipped weapons has any."
-    ),
-)
-equip_when_all_empty = BoolOption(
-    "Equip From Backpack When All Empty",
-    True,
-    description=(
-        "When every weapon you have equipped is out of ammo, pull a loaded one"
-        " out of your backpack into the slot you are holding."
+        "When the gun in your hands runs dry, switch to the next equipped slot"
+        " that still has ammo. Nothing happens if none of your weapons do."
     ),
 )
 drop_lowest_when_full = BoolOption(
     "Drop Lowest Level When Full",
     True,
     description=(
-        "When your backpack is full and there is loot worth taking, throw out"
-        " the worst of whatever kind is filling it most - the lowest level of"
-        " those, cheapest first if they tie. Anything you have marked as a"
-        " favourite is never thrown out."
-    ),
-)
-pick_lower_level = BoolOption(
-    "Pick Lower Level",
-    False,
-    description=(
-        "Collect gear weaker than the worst of its kind you already carry or have"
-        " equipped. Off by default, so a level 2 pistol is left behind once your"
-        " weakest is level 3, but taken while your weakest is level 2 or lower."
-        " Weapons compare within their own ammo type. Things without a level,"
-        " such as customizations, are never affected."
+        "When full, drop the lowest-level item of whatever kind fills your"
+        " backpack most to make room. Never a downgrade, and never a favourite."
     ),
 )
 auto_use_customizations = BoolOption(
@@ -129,8 +107,7 @@ auto_use_customizations = BoolOption(
     True,
     description=(
         "Use customizations as soon as you pick them up, unlocking the skin or"
-        " head without a trip to the backpack. Note this consumes the item, so"
-        " you cannot pass it to another player afterwards."
+        " head. This consumes the item, so you can't trade it to another player."
     ),
 )
 pickup_class_mods = DropdownOption(
@@ -148,14 +125,13 @@ pickup_class_mods = DropdownOption(
 range_percent = SliderOption(
     "Pickup Range %",
     100,
-    100,
+    25,
     500,
     25,
     True,
     description=(
-        "How far AutoLoot reaches, against your normal pickup range. 100% is"
-        " the standard distance, 200% is twice as far. Only automatic pickups"
-        " are affected - picking things up yourself still works as before."
+        "How far AutoLoot reaches, as % of your normal pickup range. 200% is"
+        " twice as far. Manual pickups are unaffected."
     ),
 )
 
@@ -285,7 +261,7 @@ def use_customizations(caller):
                 continue
             item.TryConsume()
         except Exception as ex:  # noqa: BLE001
-            logging.dev_warning(f"[AutoLoot] could not use a customization: {ex!r}")
+            logging.warning(f"[AutoLoot] could not use a customization: {ex!r}")
 
 
 # EQuickWeaponSlot, skipping QuickSelectNone at 0: Up, Down, Left, Right.
@@ -379,7 +355,7 @@ def pending_fire_modes(weapon):
         return [mode for mode in range(modes) if weapon.PendingFire(mode)]
     except Exception as ex:  # noqa: BLE001
         # Unreadable: report nothing pending so a switch is never blocked forever.
-        logging.dev_warning(f"[AutoLoot] could not read pending fire: {ex!r}")
+        logging.warning(f"[AutoLoot] could not read pending fire: {ex!r}")
         return []
 
 
@@ -446,28 +422,13 @@ def next_loaded_slot(current, by_slot):
     return None
 
 
-def next_occupied_slot(current, by_slot):
-    """The next slot after `current` holding any weapon at all, wrapping round.
-
-    Used only to pick a slot to bounce through on the way to a backpack
-    re-equip - the weapon parked there does not need ammo, since it is left
-    again immediately, unlike next_loaded_slot which is choosing where to
-    actually fight from.
-    """
-    for offset in range(1, len(WEAPON_SLOTS)):
-        slot = (current - 1 + offset) % len(WEAPON_SLOTS) + 1
-        if slot in by_slot:
-            return slot
-    return None
-
-
-def choose_loaded_backpack_weapon(caller, inventory_manager):
-    """A random backpack weapon the player is carrying ammo for, or None.
+def loaded_backpack_weapons(caller, inventory_manager):
+    """Every backpack weapon the player is carrying ammo for.
 
     player_has_ammo_for, not has_ammo: these are backpack weapons, with no
     ammo pool attached to answer HasAnyAmmo correctly.
     """
-    loaded = [
+    return [
         item
         for item in inventory_manager.Backpack
         if item is not None
@@ -475,162 +436,51 @@ def choose_loaded_backpack_weapon(caller, inventory_manager):
         and WEAPON_CLASS_TOKEN in item.Class.Name
         and player_has_ammo_for(caller, item)
     ]
-    return random.choice(loaded) if loaded else None
 
 
-def equip_loaded_weapon_from_backpack(caller, slot) -> bool:
-    """Move a loaded backpack weapon directly into `slot`.
+def weapon_signature(weapon):
+    """(ammo resource, elemental part) - what a weapon draws on to fire.
 
-    Fallback only, for the rare character with a single weapon slot unlocked,
-    where there is no other slot to bounce a re-equip through - see
-    start_backpack_reequip for the normal case, and for why replacing the
-    ACTIVE slot directly is best avoided. Still refuses while the player is
-    holding fire, since here - and only here - the slot being replaced really
-    is the one in their hands.
+    Used to spread backup slots across different ammo pools and elements
+    instead of refilling three dry-prone slots with the same kind of gun. Both
+    are plain attribute reads off DefinitionData, the same as ammo_label uses
+    for AmmoResource - never a function call. A native UFunction call here
+    (StaticGetWeaponDamageType, tried first) crashed the game: a bad call
+    fails outside Python's own exception handling, and this runs every scan
+    for every equipped weapon, so a marshalling mismatch was hit constantly.
+    ElementalPartDefinition is None for a non-elemental weapon.
     """
-    if is_holding_fire(caller):
-        return False
-
-    inventory_manager = caller.GetPawnInventoryManager()
-    if inventory_manager is None:
-        return False
-
-    chosen = choose_loaded_backpack_weapon(caller, inventory_manager)
-    if chosen is None:
-        return False
-
-    inventory_manager.ReadyBackpackInventory(chosen, slot)
-    watch_post_equip_transition(chosen)
-    return True
+    weapon_type = weapon.DefinitionData.WeaponTypeDefinition
+    ammo = None if weapon_type is None else weapon_type.AmmoResource
+    element = getattr(weapon.DefinitionData, "ElementalPartDefinition", None)
+    return (ammo, element)
 
 
-# Pulling a weapon out of the backpack into the ACTIVE slot goes through
-# WillowInventoryManager.RemoveFromInventory's rough Instigator.IsActiveWeapon
-# branch (OnUnequip + SwitchToBestWeapon), bypassing the ordinary put-down
-# sequence entirely. Every attempt to detect or wait out a bad moment to do
-# that anyway - clearing pending fire, waiting for the real fire flag to
-# clear, extending how long a diagnostic watch ran - still left the weapon and
-# crosshair dead afterwards, confirmed by a hook directly on StartFire showing
-# the engine trying to fire a weapon that read perfectly healthy by every
-# other measure. So the active slot is never handed to ReadyBackpackInventory
-# again. Instead, bounce through the next equipped slot first - the exact
-# operation switch_when_empty already relies on, which has never jammed even
-# under sustained fire - load the backpack weapon into the now INACTIVE
-# original slot, then switch back into it the same safe way:
-#
-#     stage             action just issued              waiting for
-#     ----------------  ------------------------------  ------------------------
-#     SWITCHING_AWAY    EquipWeaponFromSlot(temp)        weapon_swap_in_progress
-#     READYING          ReadyBackpackInventory(W, orig)  weapon_swap_in_progress
-#     SWITCHING_BACK    EquipWeaponFromSlot(orig)        weapon_swap_in_progress
-#
-# `orig` is not the active slot again until SWITCHING_BACK's own wait clears,
-# so RemoveFromInventory's active-weapon branch has nothing to trigger on
-# during READYING.
-_reequip: dict = {"stage": None, "temp_slot": None, "orig_slot": None, "item": None}
+def choose_backup_slot_weapon(caller, inventory_manager, avoid_signatures):
+    """A random loaded backpack weapon, preferring one unlike what's already equipped.
 
-
-def start_backpack_reequip(caller, orig_slot, temp_slot, item):
-    caller.EquipWeaponFromSlot(temp_slot)
-    _reequip.update(
-        stage="SWITCHING_AWAY", temp_slot=temp_slot, orig_slot=orig_slot, item=item
-    )
-    logging.info(
-        f"[AutoLoot] re-equip: bouncing through slot {temp_slot} to safely load"
-        f" a backpack weapon into slot {orig_slot}"
-    )
-
-
-def advance_backpack_reequip(caller) -> bool:
-    """Step the pending re-equip sequence, if one is running.
-
-    Returns whether a sequence is active, so the caller can skip its own
-    empty-weapon checks entirely while one is in flight. Starting a second
-    sequence - or running the ordinary dry-weapon logic - on top of one
-    already under way is exactly the overlap that caused the original
-    repeat-storm bug this whole mechanism replaced.
+    Only falls back to a signature already sitting in another slot when
+    nothing else carries ammo - see refill_dry_backup_slots.
     """
-    stage = _reequip["stage"]
-    if stage is None:
-        return False
-
-    if weapon_swap_in_progress(caller):
-        return True
-
-    inventory_manager = caller.GetPawnInventoryManager()
-    if inventory_manager is None:
-        _reequip["stage"] = None
-        return False
-
-    if stage == "SWITCHING_AWAY":
-        item = _reequip["item"]
-        if item not in inventory_manager.Backpack:
-            logging.dev_warning("[AutoLoot] re-equip: item left the backpack, abandoning")
-            _reequip["stage"] = None
-            return False
-        inventory_manager.ReadyBackpackInventory(item, _reequip["orig_slot"])
-        _reequip["stage"] = "READYING"
-        return True
-
-    if stage == "READYING":
-        caller.EquipWeaponFromSlot(_reequip["orig_slot"])
-        watch_post_equip_transition(_reequip["item"])
-        _reequip["stage"] = "SWITCHING_BACK"
-        return True
-
-    if stage == "SWITCHING_BACK":
-        logging.info("[AutoLoot] re-equip: complete")
-        _reequip["stage"] = None
-        return False
-
-    return False
+    loaded = loaded_backpack_weapons(caller, inventory_manager)
+    if not loaded:
+        return None
+    fresh = [item for item in loaded if weapon_signature(item) not in avoid_signatures]
+    return random.choice(fresh or loaded)
 
 
-# Diagnostic only. Two guesses at what jams the newly-equipped weapon (fire
-# held at the moment of the switch, then an overlapping second equip) were both
-# ruled out in play: it still jammed after correctly waiting for the fire
-# button to be released, with no repeated equip in the log. A third round of
-# polling every state variable for 2 seconds came back entirely clean, but the
-# player only tried firing again after that window had already closed - so
-# "clean for 2 seconds" was never actually evidence about the moment that
-# mattered. Extended to 10 seconds, and paired with a hook directly on
-# StartFire below, which captures the exact instant fire is attempted instead
-# of guessing whether a timer happened to land on it. Read-only throughout: it
-# only calls logging and getattr.
-_post_equip_watch = {"passes_left": 0, "wanted": None}
-POST_EQUIP_WATCH_PASSES = 30
-
-
-def watch_post_equip_transition(wanted_item):
-    _post_equip_watch["passes_left"] = POST_EQUIP_WATCH_PASSES
-    _post_equip_watch["wanted"] = getattr(wanted_item.Class, "Name", "?")
-
-
-def report_post_equip_transition(caller):
-    if _post_equip_watch["passes_left"] <= 0:
-        return
-    _post_equip_watch["passes_left"] -= 1
-
-    pawn = caller.Pawn
-    manager = caller.GetPawnInventoryManager()
-    current = None if pawn is None else pawn.Weapon
-    current_name = "none" if current is None else current.Class.Name
-    still_transitioning = None
-    if manager is not None:
-        try:
-            still_transitioning = bool(manager.InventoryTransitionInProgress())
-        except Exception as ex:  # noqa: BLE001
-            still_transitioning = f"<unreadable: {ex!r}>"
-
-    logging.info(
-        f"[AutoLoot] post-equip watch ({POST_EQUIP_WATCH_PASSES - _post_equip_watch['passes_left']}"
-        f"/{POST_EQUIP_WATCH_PASSES}): wanted {_post_equip_watch['wanted']}"
-        f" | now holding {current_name}"
-        f" | HasAnyAmmo: {None if current is None else has_ammo(current)}"
-        f" | IsPuttingDown: {None if current is None else bool(current.IsPuttingDown())}"
-        f" | InventoryTransitionInProgress: {still_transitioning}"
-        f" | bWantsToFire: {is_holding_fire(caller)}"
-    )
+# A backpack weapon is never readied directly into the ACTIVE slot. That goes
+# through WillowInventoryManager.RemoveFromInventory's rough
+# Instigator.IsActiveWeapon branch (OnUnequip + SwitchToBestWeapon), bypassing
+# the ordinary put-down sequence entirely - confirmed in play to leave the
+# weapon and crosshair dead afterwards even after clearing pending fire and
+# waiting out every timing guess tried. So the active slot is only ever
+# reached by EquipWeaponFromSlot (an ordinary switch), never by
+# ReadyBackpackInventory - manage_weapon_ammo only switches to a slot that is
+# already loaded, and auto_equip / refill_dry_backup_slots only ready
+# inactive slots. Loading a fresh weapon into the CURRENT slot, if ever wanted
+# again, needs the same care the game's own inventory screen takes and should
+# not be re-added lightly.
 
 
 def first_empty_weapon_slot(inventory_manager):
@@ -690,7 +540,7 @@ def fill_empty_equip_slots(caller):
     riding a vehicle. Leaning on it means slot unlock state, class requirements
     and vehicles are the game's answers rather than the mod's guesses.
     """
-    if not fill_empty_slots.value:
+    if not auto_equip.value:
         return
 
     inventory_manager = caller.GetPawnInventoryManager()
@@ -719,18 +569,54 @@ def fill_empty_equip_slots(caller):
             else:
                 inventory_manager.ReadyBackpackInventory(item)
         except Exception as ex:  # noqa: BLE001
-            logging.dev_warning(f"[AutoLoot] could not equip from the backpack: {ex!r}")
+            logging.warning(f"[AutoLoot] could not equip from the backpack: {ex!r}")
+
+
+def refill_dry_backup_slots(caller):
+    """Swap a dry weapon in any slot but the active one for a loaded backpack one.
+
+    Never touches the active slot - ReadyBackpackInventory on the slot
+    currently in the player's hands is the one call proven to jam the weapon
+    (see the comment above first_empty_weapon_slot). A dry weapon parked in a
+    slot that is not being fired needs none of that care.
+    """
+    if not auto_equip.value:
+        return
+
+    inventory_manager = caller.GetPawnInventoryManager()
+    if inventory_manager is None:
+        return
+
+    pawn = caller.Pawn
+    current = None if pawn is None else pawn.Weapon
+    current_slot = None if current is None else int(getattr(current, "QuickSelectSlot", 0))
+
+    by_slot = equipped_weapons(caller)
+    signatures = {slot: weapon_signature(weapon) for slot, weapon in by_slot.items()}
+
+    for slot, weapon in by_slot.items():
+        if slot == current_slot or has_ammo(weapon):
+            continue
+        try:
+            avoid = {sig for other_slot, sig in signatures.items() if other_slot != slot}
+            chosen = choose_backup_slot_weapon(caller, inventory_manager, avoid)
+            if chosen is None:
+                continue
+            inventory_manager.ReadyBackpackInventory(chosen, slot)
+            signatures[slot] = weapon_signature(chosen)
+        except Exception as ex:  # noqa: BLE001
+            logging.warning(f"[AutoLoot] could not refill backup slot {slot}: {ex!r}")
 
 
 def manage_weapon_ammo(caller):
-    """Get a loaded weapon into the player's hands when the current one is dry."""
-    # Serviced first and unconditionally: a re-equip already under way must be
-    # allowed to finish even if a setting changed mid-sequence, and nothing
-    # below may start a second one on top of it.
-    if advance_backpack_reequip(caller):
-        return
+    """Switch the player off a dry weapon and onto an equipped, loaded one.
 
-    if not (switch_when_empty.value or equip_when_all_empty.value):
+    Never pulls a backpack weapon into the CURRENT slot - see the comment
+    above first_empty_weapon_slot. refill_dry_backup_slots keeps the other
+    slots topped up from the backpack instead, so there is almost always
+    something loaded here to switch to.
+    """
+    if not switch_when_empty.value:
         return
 
     # Leave an in-flight swap alone. Issuing another one interrupts it, and
@@ -749,43 +635,21 @@ def manage_weapon_ammo(caller):
 
     by_slot = equipped_weapons(caller)
     loaded_slot = next_loaded_slot(current_slot, by_slot)
-    if loaded_slot is not None:
-        # Something equipped still has ammo, so the backpack is not consulted -
-        # that is what makes the second option "when *all* are empty".
-        if switch_when_empty.value:
-            modes = pending_fire_modes(current)
-            _was_firing, is_clear = stop_firing(current)
-            # Logged every time: switches are rare, and this line is the only
-            # record of the real state when one happened. Repeats of the same
-            # switch a scan apart are the signature of an interrupted swap.
-            logging.info(
-                f"[AutoLoot] slot {current_slot} -> {loaded_slot}"
-                f" | pending fire modes: {modes} | cleared: {is_clear}"
-                f"{'' if is_clear else ' | POSTPONED'}"
-            )
-            if is_clear:
-                caller.EquipWeaponFromSlot(loaded_slot)
+    if loaded_slot is None:
         return
 
-    if not equip_when_all_empty.value:
-        return
-
-    inventory_manager = caller.GetPawnInventoryManager()
-    if inventory_manager is None:
-        return
-    chosen = choose_loaded_backpack_weapon(caller, inventory_manager)
-    if chosen is None:
-        return
-
-    temp_slot = next_occupied_slot(current_slot, by_slot)
-    if temp_slot is None:
-        # Only one weapon slot unlocked, so there is nothing to bounce
-        # through - fall back to the direct, riskier equip rather than do
-        # nothing at all.
-        equip_loaded_weapon_from_backpack(caller, current_slot)
-        return
-
-    start_backpack_reequip(caller, current_slot, temp_slot, chosen)
+    modes = pending_fire_modes(current)
+    _was_firing, is_clear = stop_firing(current)
+    # Logged every time: switches are rare, and this line is the only
+    # record of the real state when one happened. Repeats of the same
+    # switch a scan apart are the signature of an interrupted swap.
+    logging.info(
+        f"[AutoLoot] slot {current_slot} -> {loaded_slot}"
+        f" | pending fire modes: {modes} | cleared: {is_clear}"
+        f"{'' if is_clear else ' | POSTPONED'}"
+    )
+    if is_clear:
+        caller.EquipWeaponFromSlot(loaded_slot)
 
 
 def dist(a, b) -> float:
@@ -880,46 +744,6 @@ def character_level(caller):
     return level if level > 0 else None
 
 
-def worst_owned_levels(caller):
-    """The lowest level held of each kind, across backpack and equipped gear.
-
-    Each is capped at the character's own level. Gear above your level is not
-    something you can use yet, so letting one lucky over-level drop set the bar
-    would have you walking past every weapon that actually suits you - which is
-    precisely what happened.
-    """
-    cap = character_level(caller)
-    worst = {}
-    for item in iter_owned_inventory(caller):
-        level = item_level(item)
-        if level is None:
-            continue
-        kind = item_kind(item)
-        if kind is None:
-            continue
-        if cap is not None:
-            level = min(level, cap)
-        if kind not in worst or level < worst[kind]:
-            worst[kind] = level
-    return worst
-
-
-def is_worth_taking(inventory, worst_levels) -> bool:
-    """Whether this is at least as good as the worst of its kind already held.
-
-    Anything without a level, or of a kind the mod does not track, is always
-    worth taking - the rule simply does not apply to it. Holding none of a kind
-    leaves nothing in worst_levels, so the first one is always collected.
-    """
-    level = item_level(inventory)
-    if level is None:
-        return True
-    kind = item_kind(inventory)
-    if kind is None:
-        return True
-    return level >= worst_levels.get(kind, level)
-
-
 # WillowInventory.PlayerMark. Derived from the game's own toggle, which sets 2
 # and then shows TF_Favorite, and sets 1 and then shows TF_Standard.
 MARK_FAVORITE = 2
@@ -983,30 +807,60 @@ def choose_item_to_drop(caller):
     )
 
 
-def free_a_backpack_slot(caller) -> bool:
-    """Throw out the worst item of whatever kind is filling the backpack most.
+def throw_backpack_item(caller, item) -> bool:
+    """Throw a specific backpack item out. Returns whether a slot was freed.
 
-    Returns whether a slot was actually freed. Only the backpack is considered,
-    never equipped gear, and never anything marked as a favourite.
+    ThrowBackpackInventory, not WillowPlayerController.ThrowInventory. The game
+    uses two different calls and the inventory screen picks between them:
+    ThrowInventory is for the equipped item and its server half refuses unless
+    `InventoryObject.Owner == pawn`, which a backpack item never satisfies - so
+    it silently did nothing at all here. ThrowBackpackInventory looks the item
+    up in Backpack and is the one that works.
+
+    Judge success by the backpack shrinking rather than by inspecting the item
+    afterwards - it has been handed to the engine by then.
+
+    Marks the item seen before throwing it, regardless of whether
+    update_seen_ids already covered it this tick. update_seen_ids runs once,
+    at the top of player_tick, before any pickups happen - an item picked up
+    earlier in that same pass, then chosen as the worst to drop for a later
+    one, was never owned at that point and so was never recorded. Without
+    this, its dropped copy reads as brand new loot, gets picked back up, and
+    - if the backpack is still full - promptly becomes the next worst item
+    to throw, cycling forever instead of settling after one drop.
     """
-    worst = choose_item_to_drop(caller)
-    if worst is None:
-        return False
+    unique_id = unique_id_of(item)
+    if unique_id is not None:
+        seen_unique_ids.add(unique_id)
 
     inventory_manager = caller.GetPawnInventoryManager()
-
-    # ThrowBackpackInventory, not WillowPlayerController.ThrowInventory. The game
-    # uses two different calls and the inventory screen picks between them:
-    # ThrowInventory is for the equipped item and its server half refuses unless
-    # `InventoryObject.Owner == pawn`, which a backpack item never satisfies - so
-    # it silently did nothing at all here. ThrowBackpackInventory looks the item
-    # up in Backpack and is the one that works.
-    #
-    # Judge success by the backpack shrinking rather than by inspecting the item
-    # afterwards - it has been handed to the engine by then.
     count_before = len(inventory_manager.Backpack)
-    inventory_manager.ThrowBackpackInventory(worst)
-    return len(inventory_manager.Backpack) < count_before
+    inventory_manager.ThrowBackpackInventory(item)
+    count_after = len(inventory_manager.Backpack)
+    freed = count_after < count_before
+    if freed:
+        # Rare enough (only when the backpack is actually full) to be worth a
+        # line every time, rather than only on failure - it is exactly the
+        # kind of "AutoLoot just threw away something I owned" event a player
+        # wants a record of.
+        logging.warning(
+            f"[AutoLoot] dropped {item_kind(item)} (lvl {item_level(item)}) to"
+            " make room"
+        )
+    else:
+        # If ThrowBackpackInventory turns out to be deferred rather than
+        # synchronous (a network RPC resolved next tick rather than inline),
+        # this is exactly what that would look like: the count read back
+        # immediately still shows the old size even though the drop is really
+        # in flight. Logging the raw counts lets that be told apart from a
+        # genuine refusal (e.g. the game itself blocking the drop) after the
+        # fact, rather than guessed at.
+        logging.warning(
+            f"[AutoLoot] tried to drop {item_kind(item)} (lvl {item_level(item)})"
+            f" to free a backpack slot, but Backpack size stayed at {count_after}"
+            " right after the call"
+        )
+    return freed
 
 
 def backpack_tally(caller):
@@ -1072,6 +926,7 @@ def format_tally(counts, levels, used, capacity):
 
 
 def report_backpack(caller):
+    global last_shown_body
     if not (hud_summary_seconds.value or summary_in_console.value):
         return
     try:
@@ -1084,14 +939,24 @@ def report_backpack(caller):
         if summary_in_console.value:
             logging.info(f"{title}\n{body}")
         if hud_summary_seconds.value:
+            if body == last_shown_body:
+                # Identical to what's already on screen. show_hud_message
+                # always clears the training-text box before re-adding to
+                # it, so calling it again here would visibly flicker/restart
+                # an unchanged message rather than smoothly extend it - do
+                # nothing instead. A genuine change (a pickup or drop while
+                # still looking at the same item, say) always has a
+                # different body and redraws normally.
+                return
             show_hud_message(title, body, hud_summary_seconds.value)
+            last_shown_body = body
     except Exception as ex:  # noqa: BLE001
-        logging.dev_warning(f"[AutoLoot] could not summarise the backpack: {ex!r}")
+        logging.warning(f"[AutoLoot] could not summarise the backpack: {ex!r}")
 
 
 @hook("WillowGame.WillowPlayerController:PlayerTick", Type.POST)
 def player_tick(obj, _args, _ret, _func):
-    global ticks_until_scan, picking_up, collected_last_pass
+    global ticks_until_scan, picking_up, collected_last_pass, next_near_loot_report
 
     ticks_until_scan -= 1
     if ticks_until_scan > 0:
@@ -1111,10 +976,10 @@ def player_tick(obj, _args, _ret, _func):
         # Fill empty slots first, so a gun that lands in one is available to the
         # dry-weapon logic below on this same pass.
         fill_empty_equip_slots(obj)
+        refill_dry_backup_slots(obj)
         manage_weapon_ammo(obj)
-        report_post_equip_transition(obj)
     except Exception as ex:  # noqa: BLE001
-        logging.dev_warning(f"[AutoLoot] could not manage equipment: {ex!r}")
+        logging.warning(f"[AutoLoot] could not manage equipment: {ex!r}")
 
     update_seen_ids(obj)
 
@@ -1124,10 +989,31 @@ def player_tick(obj, _args, _ret, _func):
         / 100
     )
     view_location = obj.CalcViewActorLocation
+
+    # Re-uses hud_summary_seconds as its own re-trigger interval - once a
+    # shown summary would have faded, standing near loot shows it again,
+    # rather than adding a separate duration to configure.
+    try:
+        now = obj.WorldInfo.TimeSeconds
+        if now >= next_near_loot_report:
+            in_range = any(
+                pickup.Inventory is not None
+                and dist(pickup.Location, view_location) <= max_dist
+                for pickup in willow_globals.PickupList
+            )
+            if in_range:
+                report_backpack(obj)
+                next_near_loot_report = now + hud_summary_seconds.value
+    except Exception as ex:  # noqa: BLE001
+        logging.warning(f"[AutoLoot] could not check for nearby loot: {ex!r}")
+
     collected_any = False
-    # Once per pass rather than per pickup: the answer cannot change until we
-    # actually collect something, and it walks the whole inventory.
-    worst_levels = {} if pick_lower_level.value else worst_owned_levels(obj)
+    # Set once this pass drops something to make room. The engine's own
+    # fullness check has been confirmed (via the warning below) to still
+    # report full immediately after ThrowBackpackInventory has already
+    # shrunk Backpack, so a second item in the same pile must not pay for
+    # a drop whose slot has not registered yet - see freed_this_pass below.
+    freed_any_slot = False
 
     # Snapshot the array before touching it. A successful pickup destroys the
     # WillowPickup, and WillowPickup.Destroyed() calls WillowGlobals.RemovePickup,
@@ -1146,12 +1032,42 @@ def player_tick(obj, _args, _ret, _func):
             # Last, because deciding about a customization calls into the game.
             if not should_pickup(inventory, obj):
                 continue
-            if not is_worth_taking(inventory, worst_levels):
-                continue
             # Only once we have decided we want this one, so a slot is never
             # given up for loot we were going to walk past anyway.
-            if drop_lowest_when_full.value and backpack_is_full(obj):
-                free_a_backpack_slot(obj)
+            was_full = backpack_is_full(obj)
+            if drop_lowest_when_full.value and was_full:
+                worst = choose_item_to_drop(obj)
+                if worst is None:
+                    logging.warning(
+                        "[AutoLoot] backpack is full and nothing in it can be"
+                        " dropped (all favourited or undroppable) - pickups"
+                        " will keep failing until something is freed up"
+                        " manually"
+                    )
+                else:
+                    new_level = item_level(inventory)
+                    worst_level = item_level(worst)
+                    if (
+                        new_level is not None
+                        and worst_level is not None
+                        and new_level < worst_level
+                    ):
+                        # Never trade down: dropping worst to make room for
+                        # something even weaker than worst would be a pure
+                        # loss. Leave this one on the ground.
+                        continue
+                    # Dropping something does not make room in time for THIS
+                    # SAME pickup attempt - confirmed in play, a slot that
+                    # Backpack itself already shows as freed still reads back
+                    # as full to whatever check gates the pickup (see the
+                    # warning below, from before this was added). Wait for
+                    # the next tick, which the fast rescan below brings very
+                    # soon, rather than attempt a doomed pickup now. If the
+                    # throw itself failed, fall through and attempt anyway -
+                    # the bottom warning covers that genuinely-stuck case.
+                    if throw_backpack_item(obj, worst):
+                        freed_any_slot = True
+                        continue
 
             # A collected pickup is destroyed inside this call, and Destroyed()
             # takes it out of PickupList. Read success off the list's length
@@ -1167,17 +1083,31 @@ def player_tick(obj, _args, _ret, _func):
             finally:
                 picking_up = False
 
-            if len(willow_globals.PickupList) < count_before:
+            picked_up = len(willow_globals.PickupList) < count_before
+            if picked_up:
                 collected_any = True
+            elif was_full:
+                # Only reached with nothing freed this iteration - dropping is
+                # off, nothing droppable existed, or the throw itself failed
+                # (each already logged its own reason above). The one path
+                # whose failure is deliberately suppressed
+                # (block_pickup_failed_message / block_failed_pickup), so
+                # without this line a rejected pickup here leaves no trace at
+                # all - it just looks like the loot was never seen.
+                logging.warning(
+                    f"[AutoLoot] wanted {item_kind(inventory)} (lvl"
+                    f" {item_level(inventory)}) but backpack was full and"
+                    f" nothing could be freed for it"
+                )
         except Exception as ex:  # noqa: BLE001
             # One bad entry must not abandon the rest of the pass.
-            logging.dev_warning(f"[AutoLoot] skipped a pickup: {ex!r}")
+            logging.warning(f"[AutoLoot] skipped a pickup: {ex!r}")
 
     # After collecting, so anything picked up this pass is used straight away and
     # the summary below already reflects it being gone.
     use_customizations(obj)
 
-    ticks_until_scan = FAST_SCAN_INTERVAL if collected_any else SCAN_INTERVAL
+    ticks_until_scan = FAST_SCAN_INTERVAL if (collected_any or freed_any_slot) else SCAN_INTERVAL
 
     # Report when the pile is finished rather than per item. show_hud_message
     # drops messages shown too close together, and one message per gun would be
@@ -1205,40 +1135,6 @@ def block_failed_pickup(_obj, _args, _ret, _func):
     return Block if picking_up else None
 
 
-# Diagnostic only, and gated: this fires every time the player pulls the
-# trigger, so it only logs while a post-equip watch is active (see
-# equip_loaded_weapon_from_backpack), to stay silent during ordinary play. It
-# exists because polling on a timer can straddle the exact moment fire is
-# attempted - and did, in play, when the player fired again about two seconds
-# after a switch, just past a 2-second poll window that had read entirely
-# clean. This captures ground truth at the instant StartFire actually runs,
-# rather than the nearest sample before or after it. Never blocks anything:
-# returns None unconditionally.
-@hook("WillowGame.WillowPlayerController:StartFire", Type.PRE)
-def log_start_fire_during_watch(obj, args, _ret, _func):
-    if _post_equip_watch["passes_left"] <= 0:
-        return None
-    try:
-        pawn = obj.Pawn
-        weapon = None if pawn is None else pawn.Weapon
-        manager = obj.GetPawnInventoryManager()
-        transitioning = None if manager is None else bool(
-            manager.InventoryTransitionInProgress()
-        )
-        logging.info(
-            f"[AutoLoot] StartFire(mode={int(getattr(args, 'FireModeNum', -1))}) fired"
-            f" | wanted {_post_equip_watch['wanted']}"
-            f" | now holding {'none' if weapon is None else weapon.Class.Name}"
-            f" | HasAnyAmmo: {None if weapon is None else weapon.HasAnyAmmo()}"
-            f" | IsPuttingDown: {None if weapon is None else bool(weapon.IsPuttingDown())}"
-            f" | InventoryTransitionInProgress: {transitioning}"
-            f" | IsZoomed: {bool(obj.IsZoomed())}"
-        )
-    except Exception as ex:  # noqa: BLE001
-        logging.dev_warning(f"[AutoLoot] could not log StartFire: {ex!r}")
-    return None
-
-
 # Listed explicitly, and in the order they should appear. Left to itself,
 # build_mod discovers options with inspect.getmembers, which sorts by *variable
 # name* - which put "hud_summary_seconds" first in the menu and
@@ -1253,11 +1149,9 @@ MOD_OPTIONS = [
     pickup_class_mods,
     pickup_customizations,
     auto_use_customizations,
-    pick_lower_level,
     drop_lowest_when_full,
-    fill_empty_slots,
+    auto_equip,
     switch_when_empty,
-    equip_when_all_empty,
     range_percent,
     hud_summary_seconds,
     summary_in_console,

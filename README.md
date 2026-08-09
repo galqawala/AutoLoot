@@ -50,11 +50,9 @@ middle choice instead:
 - **Pickup Class Mods** — *All*, *My class*, or *None* (Default: My class)
 - **Pickup Customizations** — *All*, *New only*, or *None* (Default: New only)
 - **Auto Use Customizations** (Default: On)
-- **Pick Lower Level** (Default: Off)
 - **Drop Lowest Level When Full** (Default: On)
-- **Fill Empty Equipment Slots** (Default: On)
+- **Auto Equip** (Default: On)
 - **Switch Weapon When Out Of Ammo** (Default: On)
-- **Equip From Backpack When All Empty** (Default: On)
 - **Pickup Range %** — 100% is the game's normal distance (Default: 100%, range 100–500%)
 - **Backpack HUD Summary Seconds** — 0 doesn't show it on screen at all (Default: 10, max 60)
 - **Backpack Summary In Console** (Default: On)
@@ -90,69 +88,50 @@ Being *in your inventory* is the only thing that marks an item as seen — merel
 pick something up does not. So an item you couldn't take because your backpack was full is
 picked up normally later, once you have room for it.
 
-### Pick Lower Level
+AutoLoot always collects gear regardless of level — a level 2 pistol is picked up even if you
+already carry a level 30 one. The only place level is ever compared is deciding what to throw
+out when your backpack is full and needs room; see **Drop Lowest Level When Full** below.
 
-Off by default, so AutoLoot skips gear that is weaker than the best of its kind you already
-carry or have equipped. Weapons compete only within their own ammo type, so a great SMG
-never stops you picking up a pistol.
+### Auto Equip
 
-With a level 2 pistol on the ground:
+Fills any empty gear slot from your backpack — a weapon slot, or your shield, grenade mod,
+class mod or artifact — as soon as you have something for it. Whether a slot is available at
+all is the game's own answer (`InventoryShouldBeReadiedWhenEquipped`), so weapon slots you
+haven't unlocked yet are skipped, class mods your character can't use are skipped, and
+nothing is equipped while you're riding a vehicle.
 
-| Best pistol you hold | Result |
-| --- | --- |
-| none | picked up |
-| level 1 | picked up |
-| level 2 | picked up |
-| level 3 or above | left behind |
-
-Anything whose level can't be read is picked up regardless, as is anything with no level at
-all — customizations are never affected by this setting. Turn it on to go back to
-collecting everything.
-
-### Filling empty slots
-
-**Fill Empty Equipment Slots** equips something from your backpack into any slot standing
-empty — a weapon slot, or your shield, grenade mod, class mod or artifact. Slots that
-already hold something are never touched, and only weapons that have ammo are used.
-
-Whether a slot is available at all is the game's own answer
-(`InventoryShouldBeReadiedWhenEquipped`), so weapon slots you haven't unlocked yet are
-skipped, class mods your character can't use are skipped, and nothing is equipped while
-you're riding a vehicle.
+It also tops up any weapon slot other than the one you're holding the moment its weapon runs
+dry, swapping in a loaded backpack weapon. It prefers one with a different ammo type and
+element than what's already in your other slots, and only reuses a matching one if that's the
+only loaded option left. Your *active* slot is never touched directly by this — see
+**Running dry** below.
 
 ### Running dry
 
 When the gun in your hands runs out of ammo, **Switch Weapon When Out Of Ammo** moves you to
-the next slot holding one that still has some, wrapping round from slot 4 back to slot 1.
+the next equipped slot that still has ammo, wrapping round from slot 4 back to slot 1.
 Holding slot 3 with both 3 and 4 empty puts you on slot 1; if slot 4 had ammo you'd get slot
 4 instead. Slots you haven't unlocked yet are simply skipped, so this works the same with
-one slot or four.
-
-If *every* equipped weapon is dry, **Equip From Backpack When All Empty** pulls a loaded
-weapon out of your backpack into the slot you're holding. If there's nothing loaded
-anywhere, nothing happens and you keep what you have.
+one slot or four. Nothing happens if none of your equipped weapons has any — with **Auto
+Equip** on, that's rare, since your other slots are kept topped up as they run dry.
 
 "Out of ammo" is the game's own `HasAnyAmmo` test, so it counts the clip as well as the
 reserve, and it won't switch away from a TPS laser that only overheats.
 
-Pulling a backpack weapon straight into your active slot turned out to be unreliable — the
-game's own removal path for the weapon in your hands takes a rougher route than a normal
-weapon switch, and no amount of waiting for the right moment (fire released, no transition in
-flight) made it safe; it could still leave the new weapon unable to fire, zoom, or even show
-a crosshair, with no error anywhere. So AutoLoot never touches your active slot directly for
-this any more. Instead it bounces through another equipped slot first — the same plain weapon
-switch **Switch Weapon When Out Of Ammo** already uses safely — loads the backpack weapon into
-your *previous* slot while you're standing on the other one, then switches back. Three quick,
-ordinary weapon switches instead of one risky backpack operation on the gun in your hands —
-you'll briefly see the other weapon in your hands while this happens. If only one weapon slot
-is unlocked there's nothing to bounce through, so that one case still equips directly as
-before.
+AutoLoot never pulls a backpack weapon directly into your *active* slot — the game's own
+removal path for the weapon in your hands takes a rougher route than a normal weapon switch,
+and testing found no safe moment to do it (fire released, no transition in flight) that didn't
+still risk leaving the new weapon unable to fire, zoom, or show a crosshair, with no error
+anywhere. Getting a fresh weapon into your hands is left entirely to the plain weapon switch
+above, which has never shown that problem.
 
 ### Drop Lowest Level When Full
 
 On by default. When your backpack is full and there's loot worth taking, AutoLoot makes room
 by throwing out the worst item of whatever kind is filling the bag most — so the category
-you're hoarding gives up a slot rather than the one thing you own of something.
+you're hoarding gives up a slot rather than the one thing you own of something. It never makes
+this trade if the item on the ground is actually weaker than the one it would throw out — that
+loot is simply left for later instead.
 
 Say the bag is full and a pistol is on the ground:
 
