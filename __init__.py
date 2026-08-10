@@ -82,8 +82,9 @@ auto_equip = BoolOption(
     "Auto Equip",
     True,
     description=(
-        "Fill empty gear slots from your backpack, and swap a dry weapon for a"
-        " loaded one in any slot but the one you're holding."
+        "Fill empty gear slots, swap a dry weapon for a loaded one, and"
+        " diversify duplicate elements - all in any slot but the one you're"
+        " holding."
     ),
 )
 switch_when_empty = BoolOption(
@@ -443,18 +444,16 @@ def weapon_signature(weapon):
     """(ammo resource, elemental part) - what a weapon draws on to fire.
 
     Used to spread backup slots across different ammo pools and elements
-    instead of refilling three dry-prone slots with the same kind of gun. Both
-    are plain attribute reads off DefinitionData, the same as ammo_label uses
-    for AmmoResource - never a function call. A native UFunction call here
+    instead of refilling three dry-prone slots with the same kind of gun.
+    item_element is a plain attribute read, the same as ammo_label uses for
+    AmmoResource - never a function call. A native UFunction call here
     (StaticGetWeaponDamageType, tried first) crashed the game: a bad call
     fails outside Python's own exception handling, and this runs every scan
     for every equipped weapon, so a marshalling mismatch was hit constantly.
-    ElementalPartDefinition is None for a non-elemental weapon.
     """
     weapon_type = weapon.DefinitionData.WeaponTypeDefinition
     ammo = None if weapon_type is None else weapon_type.AmmoResource
-    element = getattr(weapon.DefinitionData, "ElementalPartDefinition", None)
-    return (ammo, element)
+    return (ammo, item_element(weapon))
 
 
 def choose_backup_slot_weapon(caller, inventory_manager, avoid_signatures):
@@ -609,6 +608,63 @@ def refill_dry_backup_slots(caller):
             logging.warning(f"[AutoLoot] could not refill backup slot {slot}: {ex!r}")
 
 
+def diversify_equipped_elements(caller):
+    """Swap one of a pair of equipped weapons sharing an element for a fresh one.
+
+    Non-elemental counts as its own element here - item_element already
+    returns the same None for every non-elemental weapon, so two plain
+    weapons equipped together count as "sharing an element" exactly like two
+    Fire weapons would, with no special-casing needed. Never touches the
+    active slot, for the same reason refill_dry_backup_slots does not - see
+    the comment above first_empty_weapon_slot.
+    """
+    if not auto_equip.value:
+        return
+
+    inventory_manager = caller.GetPawnInventoryManager()
+    if inventory_manager is None:
+        return
+
+    pawn = caller.Pawn
+    current = None if pawn is None else pawn.Weapon
+    current_slot = None if current is None else int(getattr(current, "QuickSelectSlot", 0))
+
+    by_slot = equipped_weapons(caller)
+    elements = {slot: item_element(weapon) for slot, weapon in by_slot.items()}
+    by_element = {}
+    for slot, element in elements.items():
+        by_element.setdefault(element, []).append(slot)
+
+    for slots in by_element.values():
+        if len(slots) < 2:
+            continue
+        replaceable = [slot for slot in slots if slot != current_slot]
+        if not replaceable:
+            continue
+        # Random rather than always the same slot in the pair, so which one
+        # gets swapped is not permanently biased toward e.g. the lowest slot
+        # number.
+        slot = random.choice(replaceable)
+        try:
+            other_elements = {e for s, e in elements.items() if s != slot}
+            fresh = [
+                item
+                for item in loaded_backpack_weapons(caller, inventory_manager)
+                if item_element(item) not in other_elements
+            ]
+            if not fresh:
+                continue
+            chosen = random.choice(fresh)
+            old_kind = item_kind(by_slot[slot])
+            inventory_manager.ReadyBackpackInventory(chosen, slot)
+            logging.warning(
+                f"[AutoLoot] slot {slot}: {old_kind} -> {item_kind(chosen)},"
+                " no longer sharing an element with another slot"
+            )
+        except Exception as ex:  # noqa: BLE001
+            logging.warning(f"[AutoLoot] could not diversify slot {slot}: {ex!r}")
+
+
 def manage_weapon_ammo(caller):
     """Switch the player off a dry weapon and onto an equipped, loaded one.
 
@@ -758,6 +814,59 @@ def item_price(item) -> int:
         return 0
 
 
+def item_element(item):
+    """This weapon's damage type (Fire, Corrosive, ...), or None for no element.
+
+    Only weapons expose an elemental part as a plain field
+    (DefinitionData.ElementalPartDefinition). Non-weapon items (shields,
+    grenade mods, class mods, artifacts) encode their element, if any, in one
+    of several generically-named part slots with no reliable way to tell
+    which one is the elemental slot without a native call - and this
+    codebase does not call unverified native functions after
+    StaticGetWeaponDamageType crashed the game (see weapon_signature). They
+    are grouped as "no element" instead, which just means grouping by
+    element does not distinguish between them.
+
+    The part object itself is not a safe grouping key: different weapon
+    types/manufacturers each carry their OWN distinct WeaponPartDefinition
+    for what is semantically the same element, so two corrosive weapons of
+    different types can have different ElementalPartDefinition references
+    and never group together - confirmed in play (two equipped corrosive
+    weapons not recognised as sharing an element). The part's own
+    CustomDamageTypeDefinition.DamageType is the actual semantic value, a
+    plain enum safe to read - the same field SetElementalFrame reads to pick
+    the HUD's elemental icon - and is what grouping compares instead. Falls
+    back to the part object only if that chain is ever unreadable, which is
+    still safe, just as imprecise as before in that rare case.
+
+    Some weapon types (SMGs observed directly) roll an explicit "no element"
+    WeaponPartDefinition into this slot as one weighted option among the real
+    elements, rather than ever leaving the slot a true null reference.
+    Checking the part's own name for "none" catches that case before the
+    damage-type lookup runs, so both representations of "no element" collapse
+    to the same value.
+    """
+    if item is None or item.Class is None or WEAPON_CLASS_TOKEN not in item.Class.Name:
+        return None
+    part = getattr(item.DefinitionData, "ElementalPartDefinition", None)
+    if part is None:
+        return None
+    if "none" in str(getattr(part, "Name", "")).lower():
+        return None
+    damage_type = getattr(getattr(part, "CustomDamageTypeDefinition", None), "DamageType", None)
+    if damage_type is None:
+        return part
+    try:
+        return int(damage_type)
+    except Exception:  # noqa: BLE001
+        return damage_type
+
+
+def item_rarity(item):
+    """This item's rarity tier - a plain field on WillowInventory, higher is rarer."""
+    return getattr(item, "RarityLevel", None)
+
+
 def is_favorite(item) -> bool:
     try:
         return int(item.GetMark()) == MARK_FAVORITE
@@ -774,63 +883,137 @@ def backpack_is_full(caller) -> bool:
     )
 
 
-def usability_rank(item, cap):
-    """How little this item is worth keeping right now: smaller sorts first.
+def _tied_for_most(items, key_func):
+    """Every item in whichever group(s) tie for the most members.
 
-    Above your own level (`cap`), an item is dead weight - you cannot equip
-    it until you level up to it, so it is worth nothing right now no matter
-    how high its number looks. Every over-level item ranks below every
-    usable one, and among over-level items the ONE FURTHEST above your level
-    ranks lowest, since it is the one you are furthest from ever being able
-    to use - keeping the ones closer to your level instead means the item
-    nearest to becoming useful is the one lost. Only once nothing is
-    over-level does level ordering flip back to the old rule: the weakest
-    USABLE item ranks lowest.
-
-        character level 28, backpack: 29, 29, 31, 24
-        over-level group (ranks lowest, worth least): 31, then the 29s
-        at-or-under group (only ranks lowest once the above is empty): 24
-
-    Shared by choose_item_to_drop, deciding what to sacrifice, and the
-    never-trade-down check in player_tick, deciding whether a pickup is
-    actually better than what it would cost - the same ranking must answer
-    both, or an over-level item could rank "worse" for one purpose and
-    "better" for the other.
+    Returns (kept_items, groups) - groups is the full breakdown, handed back
+    so a caller that wants to log what was actually used can, without this
+    helper needing to know anything about logging.
     """
-    level = item_level(item) or 0
-    over_level = cap is not None and level > cap
-    return (0, -level) if over_level else (1, level)
+    groups = {}
+    for item in items:
+        groups.setdefault(key_func(item), []).append(item)
+    biggest = max(len(group) for group in groups.values())
+    kept_labels = {label for label, group in groups.items() if len(group) == biggest}
+    return [item for item in items if key_func(item) in kept_labels], groups
 
 
-def choose_item_to_drop(caller):
-    """The item that would be thrown out to make room, or None.
+def _tied_for_extreme(items, key_func, pick_max):
+    """Every item tied for the highest (pick_max) or lowest key value.
 
-    Split from the throwing so the decision can be checked against a live game
-    without changing anything - see verify_autoloot.py.
+    Returns (kept_items, target) - target is the winning value, for logging.
+    """
+    target = (max if pick_max else min)(key_func(item) for item in items)
+    return [item for item in items if key_func(item) == target], target
+
+
+def droppable_backpack_items(caller):
+    """Every real backpack item eligible to be thrown out, as a plain list.
+
+    A real Python list of item references - copy it, filter it, add fake
+    entries, whatever a caller needs - none of that touches the actual
+    inventory. Unlike the objects it contains, the list itself is completely
+    ordinary data.
     """
     inventory_manager = caller.GetPawnInventoryManager()
     if inventory_manager is None:
+        return []
+    return [
+        item
+        for item in inventory_manager.Backpack
+        if item_kind(item) is not None and not is_favorite(item) and caller.CanDrop(item)
+    ]
+
+
+def choose_worst_item(candidates, cap, log=False):
+    """Which of these items would be thrown out to make room, or None.
+
+    Pure: only ever reads its argument list and character level, never
+    touches the game. That is what lets a caller simulate "what if" - drop
+    this, add that - just by building a different plain list beforehand,
+    the same way you would edit a copy of any other Python data, rather
+    than needing to duplicate the real backpack.
+
+    A fixed cascade, each step narrowing the field rather than picking
+    outright, so a later step only ever breaks ties an earlier one left
+    standing:
+
+      1. The kind (ammo type or category) with the most items - every kind
+         tied for the most is kept, not just one of them.
+      2. Split what remains into usable (<= your level) and over-level
+         (dead weight - unusable until you level up); keep whichever group
+         is bigger, over-level on a tie, since it is the one worth nothing
+         right now.
+      3. Among what remains, whichever level is furthest from your own, in
+         either direction.
+      4. The elemental type with the most items - same all-ties-kept rule
+         as the kind step.
+      5. The lowest rarity.
+      6. The cheapest.
+      7. The lowest unique id of whatever is still tied after all of the
+         above - deterministic, unlike a random pick, which matters because
+         callers re-run this same cascade on a hypothetical list to answer
+         "would this become the next drop" and must get the same answer
+         both times for an unchanged list.
+    """
+    candidates = list(candidates)
+    if not candidates:
         return None
 
-    by_kind = {}
-    for item in inventory_manager.Backpack:
-        kind = item_kind(item)
-        if kind is None or is_favorite(item) or not caller.CanDrop(item):
-            continue
-        by_kind.setdefault(kind, []).append(item)
+    # One line per drop, not one per step: each step appends a short trace
+    # entry instead of logging on the spot, so a busy pile full of drops
+    # gets a single readable line each rather than a burst of seven.
+    trace = []
 
-    if not by_kind:
-        return None
+    candidates, kind_groups = _tied_for_most(candidates, item_kind)
+    if log:
+        sizes = {label: len(group) for label, group in kind_groups.items()}
+        trace.append(f"kind {sizes}")
 
-    # Most numerous kind, then within it the item worth least right now.
-    # Every tie is broken by something stable so the same backpack always gives
-    # up the same item rather than whichever happened to be looked at first.
-    fullest = min(by_kind, key=lambda kind: (-len(by_kind[kind]), kind))
-    cap = character_level(caller)
-    return min(
-        by_kind[fullest],
-        key=lambda item: (usability_rank(item, cap), item_price(item), unique_id_of(item) or 0),
-    )
+    if cap is not None and len(candidates) > 1:
+        over_level = [item for item in candidates if (item_level(item) or 0) > cap]
+        usable = [item for item in candidates if (item_level(item) or 0) <= cap]
+        if over_level and usable:
+            # Ties go to over-level: it is worth nothing to keep right now,
+            # so an equal split should not cost you something usable instead.
+            candidates = over_level if len(over_level) >= len(usable) else usable
+            if log:
+                trace.append(f"over-level {len(over_level)} vs usable {len(usable)}")
+
+    if cap is not None and len(candidates) > 1:
+        candidates, diff = _tied_for_extreme(
+            candidates, lambda item: abs((item_level(item) or 0) - cap), pick_max=True
+        )
+        if log:
+            trace.append(f"furthest from level ({diff})")
+
+    if len(candidates) > 1:
+        candidates, element_groups = _tied_for_most(candidates, item_element)
+        if log:
+            sizes = {label: len(group) for label, group in element_groups.items()}
+            trace.append(f"element {sizes}")
+
+    if len(candidates) > 1:
+        candidates, rarity = _tied_for_extreme(
+            candidates, lambda item: item_rarity(item) or 0, pick_max=False
+        )
+        if log:
+            trace.append(f"rarity {rarity}")
+
+    if len(candidates) > 1:
+        candidates, price = _tied_for_extreme(candidates, item_price, pick_max=False)
+        if log:
+            trace.append(f"price ${price}")
+
+    chosen = min(candidates, key=lambda item: unique_id_of(item) or 0)
+    if log:
+        if len(candidates) > 1:
+            trace.append("lowest id")
+        logging.info(
+            f"[AutoLoot] drop: {item_kind(chosen)} (lvl {item_level(chosen)})"
+            f" | {' -> '.join(trace)}"
+        )
+    return chosen
 
 
 def throw_backpack_item(caller, item) -> bool:
@@ -1003,6 +1186,7 @@ def player_tick(obj, _args, _ret, _func):
         # dry-weapon logic below on this same pass.
         fill_empty_equip_slots(obj)
         refill_dry_backup_slots(obj)
+        diversify_equipped_elements(obj)
         manage_weapon_ammo(obj)
     except Exception as ex:  # noqa: BLE001
         logging.warning(f"[AutoLoot] could not manage equipment: {ex!r}")
@@ -1015,8 +1199,9 @@ def player_tick(obj, _args, _ret, _func):
         / 100
     )
     view_location = obj.CalcViewActorLocation
-    # Read once per pass: it cannot change mid-pass, and choose_item_to_drop
-    # and the never-trade-down check below must agree on the same value.
+    # Read once per pass: it cannot change mid-pass, and choose_worst_item
+    # needs the same value for both the real decision and every hypothetical
+    # check derived from it.
     cap = character_level(obj)
 
     # Re-uses hud_summary_seconds as its own re-trigger interval - once a
@@ -1043,6 +1228,11 @@ def player_tick(obj, _args, _ret, _func):
     # shrunk Backpack, so a second item in the same pile must not pay for
     # a drop whose slot has not registered yet - see freed_this_pass below.
     freed_any_slot = False
+    # The real backpack does not change between ground items in this same
+    # pass, only once an actual drop happens - cached so N loose items in
+    # one pile do not each re-read and re-filter the whole backpack.
+    have_cached_real_items = False
+    cached_real_items = []
 
     # Snapshot the array before touching it. A successful pickup destroys the
     # WillowPickup, and WillowPickup.Destroyed() calls WillowGlobals.RemovePickup,
@@ -1061,40 +1251,45 @@ def player_tick(obj, _args, _ret, _func):
             # Last, because deciding about a customization calls into the game.
             if not should_pickup(inventory, obj):
                 continue
-            # Only once we have decided we want this one, so a slot is never
-            # given up for loot we were going to walk past anyway.
             was_full = backpack_is_full(obj)
-            if drop_lowest_when_full.value and was_full:
-                worst = choose_item_to_drop(obj)
-                if worst is None:
-                    logging.warning(
-                        "[AutoLoot] backpack is full and nothing in it can be"
-                        " dropped (all favourited or undroppable) - pickups"
-                        " will keep failing until something is freed up"
-                        " manually"
-                    )
-                else:
-                    if usability_rank(inventory, cap) < usability_rank(worst, cap):
-                        # Never trade down: dropping worst to make room for
-                        # something ranked even lower would be a pure loss -
-                        # same ranking choose_item_to_drop used to pick worst
-                        # in the first place, so an over-level worst never
-                        # looks "better" here than an on-level pickup just
-                        # because its raw number happens to be lower. Leave
-                        # this one on the ground.
-                        continue
-                    # Dropping something does not make room in time for THIS
-                    # SAME pickup attempt - confirmed in play, a slot that
-                    # Backpack itself already shows as freed still reads back
-                    # as full to whatever check gates the pickup (see the
-                    # warning below, from before this was added). Wait for
-                    # the next tick, which the fast rescan below brings very
-                    # soon, rather than attempt a doomed pickup now. If the
-                    # throw itself failed, fall through and attempt anyway -
-                    # the bottom warning covers that genuinely-stuck case.
-                    if throw_backpack_item(obj, worst):
-                        freed_any_slot = True
-                        continue
+            if drop_lowest_when_full.value:
+                if not have_cached_real_items:
+                    cached_real_items = droppable_backpack_items(obj)
+                    have_cached_real_items = True
+                # Would these same rules choose this over everything already
+                # held? Checked unconditionally, not just while full - taking
+                # something that only gets thrown back out later is wasted
+                # motion even with room to spare, and worse in co-op: it
+                # denies the item to a player who might actually want it.
+                would_drop = choose_worst_item(cached_real_items + [inventory], cap)
+                if unique_id_of(would_drop) == unique_id_of(inventory):
+                    continue
+                # Only once we have decided we want this one, so a slot is
+                # never given up for loot we were going to walk past anyway.
+                if was_full:
+                    worst = choose_worst_item(cached_real_items, cap, log=True)
+                    if worst is None:
+                        logging.warning(
+                            "[AutoLoot] backpack is full and nothing in it can"
+                            " be dropped (all favourited or undroppable) -"
+                            " pickups will keep failing until something is"
+                            " freed up manually"
+                        )
+                    else:
+                        # Dropping something does not make room in time for
+                        # THIS SAME pickup attempt - confirmed in play, a slot
+                        # that Backpack itself already shows as freed still
+                        # reads back as full to whatever check gates the
+                        # pickup (see the warning below, from before this was
+                        # added). Wait for the next tick, which the fast
+                        # rescan below brings very soon, rather than attempt a
+                        # doomed pickup now. If the throw itself failed, fall
+                        # through and attempt anyway - the bottom warning
+                        # covers that genuinely-stuck case.
+                        if throw_backpack_item(obj, worst):
+                            freed_any_slot = True
+                            have_cached_real_items = False
+                            continue
 
             # A collected pickup is destroyed inside this call, and Destroyed()
             # takes it out of PickupList. Read success off the list's length

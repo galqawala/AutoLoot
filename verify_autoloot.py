@@ -230,8 +230,12 @@ def main():
 
     section("what the mod would decide right now")
     attempt(
-        "choose_item_to_drop(pc)  [not dropped]",
-        lambda: name_of(autoloot.choose_item_to_drop(pc)),
+        "choose_worst_item(droppable_backpack_items(pc), character_level(pc))  [not dropped]",
+        lambda: name_of(
+            autoloot.choose_worst_item(
+                autoloot.droppable_backpack_items(pc), autoloot.character_level(pc)
+            )
+        ),
     )
     attempt(
         "backpack items that would fill a slot",
