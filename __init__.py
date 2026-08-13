@@ -944,10 +944,10 @@ def choose_worst_item(candidates, cap, log=False):
          (dead weight - unusable until you level up); keep whichever group
          is bigger, over-level on a tie, since it is the one worth nothing
          right now.
-      3. Among what remains, whichever level is furthest from your own, in
-         either direction.
-      4. The elemental type with the most items - same all-ties-kept rule
+      3. The elemental type with the most items - same all-ties-kept rule
          as the kind step.
+      4. Among what remains, whichever level is furthest from your own, in
+         either direction.
       5. The lowest rarity.
       6. The cheapest.
       7. The lowest unique id of whatever is still tied after all of the
@@ -980,18 +980,18 @@ def choose_worst_item(candidates, cap, log=False):
             if log:
                 trace.append(f"over-level {len(over_level)} vs usable {len(usable)}")
 
+    if len(candidates) > 1:
+        candidates, element_groups = _tied_for_most(candidates, item_element)
+        if log:
+            sizes = {label: len(group) for label, group in element_groups.items()}
+            trace.append(f"element {sizes}")
+
     if cap is not None and len(candidates) > 1:
         candidates, diff = _tied_for_extreme(
             candidates, lambda item: abs((item_level(item) or 0) - cap), pick_max=True
         )
         if log:
             trace.append(f"furthest from level ({diff})")
-
-    if len(candidates) > 1:
-        candidates, element_groups = _tied_for_most(candidates, item_element)
-        if log:
-            sizes = {label: len(group) for label, group in element_groups.items()}
-            trace.append(f"element {sizes}")
 
     if len(candidates) > 1:
         candidates, rarity = _tied_for_extreme(
