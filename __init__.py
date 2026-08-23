@@ -21,7 +21,6 @@ ticks_until_scan = 0
 seen_unique_ids = set()
 picking_up = False
 collected_last_pass = False
-next_near_loot_report = 0.0
 last_shown_body = None
 
 pickup_weapons = BoolOption("Pickup Weapons", True)
@@ -867,6 +866,20 @@ def item_rarity(item):
     return getattr(item, "RarityLevel", None)
 
 
+def item_log_line(item) -> str:
+    """One compact description of an item for pickup logging: kind, level,
+    rarity, element, price - the same fields choose_worst_item's own trace
+    already reasons about, so a pickup line reads consistently with a drop
+    line. No name/manufacturer lookup exists in this codebase (unlike
+    AutoLootBL1E's item_full_name) - kept to fields already available here
+    rather than adding a new one for this alone.
+    """
+    return (
+        f"{item_kind(item)} | lvl {item_level(item)} | rarity {item_rarity(item)}"
+        f" | element {item_element(item)} | price ${item_price(item)}"
+    )
+
+
 def is_favorite(item) -> bool:
     try:
         return int(item.GetMark()) == MARK_FAVORITE
@@ -1165,7 +1178,7 @@ def report_backpack(caller):
 
 @hook("WillowGame.WillowPlayerController:PlayerTick", Type.POST)
 def player_tick(obj, _args, _ret, _func):
-    global ticks_until_scan, picking_up, collected_last_pass, next_near_loot_report
+    global ticks_until_scan, picking_up, collected_last_pass
 
     ticks_until_scan -= 1
     if ticks_until_scan > 0:
@@ -1203,23 +1216,6 @@ def player_tick(obj, _args, _ret, _func):
     # needs the same value for both the real decision and every hypothetical
     # check derived from it.
     cap = character_level(obj)
-
-    # Re-uses hud_summary_seconds as its own re-trigger interval - once a
-    # shown summary would have faded, standing near loot shows it again,
-    # rather than adding a separate duration to configure.
-    try:
-        now = obj.WorldInfo.TimeSeconds
-        if now >= next_near_loot_report:
-            in_range = any(
-                pickup.Inventory is not None
-                and dist(pickup.Location, view_location) <= max_dist
-                for pickup in willow_globals.PickupList
-            )
-            if in_range:
-                report_backpack(obj)
-                next_near_loot_report = now + hud_summary_seconds.value
-    except Exception as ex:  # noqa: BLE001
-        logging.warning(f"[AutoLoot] could not check for nearby loot: {ex!r}")
 
     collected_any = False
     # Set once this pass drops something to make room. The engine's own
@@ -1298,6 +1294,8 @@ def player_tick(obj, _args, _ret, _func):
             # answer is the same either way. This only decides whether to rescan
             # early - a refusal must not pin us to the fast interval.
             count_before = len(willow_globals.PickupList)
+            # Captured before the pickup, never read after - same reason.
+            log_line = item_log_line(inventory)
 
             picking_up = True
             try:
@@ -1308,6 +1306,7 @@ def player_tick(obj, _args, _ret, _func):
             picked_up = len(willow_globals.PickupList) < count_before
             if picked_up:
                 collected_any = True
+                logging.info(f"[AutoLoot] pickup: {log_line}")
             elif was_full:
                 # Only reached with nothing freed this iteration - dropping is
                 # off, nothing droppable existed, or the throw itself failed
