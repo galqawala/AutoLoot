@@ -22,6 +22,23 @@ seen_unique_ids = set()
 picking_up = False
 collected_last_pass = False
 last_shown_body = None
+warned_remote_client = False
+
+# Network-transition safety. Joining a session (or any level travel) tears
+# down and rebuilds the Pawn/Controller/InventoryManager, and there is no
+# confirmed-safe way to know from here whether that rebuild is complete -
+# firing a mutating native call (drop, equip, pickup) against a
+# half-initialized object during that window is exactly the kind of thing
+# that could corrupt more save state than the field it directly touches, or
+# stall the join handshake outright. Confirmed on the willow1 port of this
+# mod (AutoLootBL1E): backpack capacity, weapon slots and XP were all found
+# reset immediately after joining another player's session, traced to this
+# exact class of call with no guard against the transition. Detected via
+# WorldInfo identity - a new instance means a new level/session - rather than
+# trying to catch the transition event itself.
+last_world_info = None
+world_settled_at = None
+TRANSITION_GRACE_SECONDS = 10.0
 
 pickup_weapons = BoolOption("Pickup Weapons", True)
 pickup_shields = BoolOption("Pickup Shields", True)
@@ -1176,6 +1193,59 @@ def report_backpack(caller):
         logging.warning(f"[AutoLoot] could not summarise the backpack: {ex!r}")
 
 
+def is_remote_client(caller) -> bool:
+    """Whether this player is a network client, not the host/server.
+
+    WorldInfo.Game is only ever populated on the server. Auto-equip
+    (ReadyBackpackInventory) routes through a `reliable server function` the
+    same way BL1E's port of this mod found does not reliably land when
+    called from Python on a client (confirmed there via a debounced series of
+    requests that never landed once, and by identical Role values between a
+    working manual equip and a non-working mod-triggered one, ruling out an
+    ownership mismatch). ThrowBackpackInventory (drop) is the one call
+    confirmed to still work as a client there, so it is left ungated here.
+    """
+    return caller.WorldInfo.Game is None
+
+
+def warn_remote_client_once() -> None:
+    """Logged once per session, not every tick - nothing about this changes
+    tick to tick."""
+    global warned_remote_client
+    if warned_remote_client:
+        return
+    warned_remote_client = True
+    logging.warning(
+        "[AutoLoot] this player is a remote client, not the host -"
+        " WorldInfo.Game is never available here, so auto-equip's"
+        " ReadyBackpackInventory RPC may not actually reach the server (see"
+        " AutoLootBL1E's findings on the same call). Auto-drop-when-full is"
+        " unaffected. Manual equip is unaffected. (Not logged again this"
+        " session.)"
+    )
+
+
+def world_has_settled(obj) -> bool:
+    """False for a short grace period right after a new level/session appears.
+
+    See the module-level comment above last_world_info for why this exists.
+    """
+    global last_world_info, world_settled_at
+    world_info = obj.WorldInfo
+    if world_info is not last_world_info:
+        last_world_info = world_info
+        world_settled_at = None
+    now = world_info.TimeSeconds
+    if world_settled_at is None:
+        world_settled_at = now + TRANSITION_GRACE_SECONDS
+        logging.info(
+            f"[AutoLoot] new world/session detected - pausing all"
+            f" pickups/drops/equips for {TRANSITION_GRACE_SECONDS:.0f}s while"
+            " it settles"
+        )
+    return now >= world_settled_at
+
+
 @hook("WillowGame.WillowPlayerController:PlayerTick", Type.POST)
 def player_tick(obj, _args, _ret, _func):
     global ticks_until_scan, picking_up, collected_last_pass
@@ -1192,14 +1262,27 @@ def player_tick(obj, _args, _ret, _func):
         ticks_until_scan = SCAN_INTERVAL
         return
 
+    try:
+        settled = world_has_settled(obj)
+    except Exception as ex:  # noqa: BLE001
+        logging.warning(f"[AutoLoot] world_has_settled crashed: {ex!r}")
+        ticks_until_scan = SCAN_INTERVAL
+        return
+    if not settled:
+        ticks_until_scan = SCAN_INTERVAL
+        return
+
     # Before looting: an empty gun is more urgent than a pickup, and this runs
     # whether or not there is anything on the ground.
     try:
         # Fill empty slots first, so a gun that lands in one is available to the
         # dry-weapon logic below on this same pass.
-        fill_empty_equip_slots(obj)
-        refill_dry_backup_slots(obj)
-        diversify_equipped_elements(obj)
+        if not is_remote_client(obj):
+            fill_empty_equip_slots(obj)
+            refill_dry_backup_slots(obj)
+            diversify_equipped_elements(obj)
+        else:
+            warn_remote_client_once()
         manage_weapon_ammo(obj)
     except Exception as ex:  # noqa: BLE001
         logging.warning(f"[AutoLoot] could not manage equipment: {ex!r}")
